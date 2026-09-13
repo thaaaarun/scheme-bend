@@ -1,0 +1,16 @@
+[package]
+name = "scheme-bend"
+version = "0.1.0"
+edition = "2024"
+description = "A small immutable Scheme-to-Bend compiler"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "scheme_bend"
+path = "src/lib.rs"
+
+[[bin]]
+name = "scheme-bend"
+path = "src/main.rs"
+
+[dependencies]

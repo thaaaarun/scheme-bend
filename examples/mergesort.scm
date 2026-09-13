@@ -1,0 +1,25 @@
+; Immutable merge sort. expected first element: 1
+(define (merge left right)
+  (if (null? left)
+      right
+      (if (null? right)
+          left
+          (if (< (car left) (car right))
+              (cons (car left) (merge (cdr left) right))
+              (cons (car right) (merge left (cdr right)))))))
+(define (split xs)
+  (if (null? xs)
+      (cons () ())
+      (if (null? (cdr xs))
+          (cons (cons (car xs) ()) ())
+          (let ((parts (split (cdr (cdr xs)))))
+            (cons (cons (car xs) (car parts))
+                  (cons (car (cdr xs)) (cdr parts)))))))
+(define (mergesort xs)
+  (if (null? xs)
+      ()
+      (if (null? (cdr xs))
+          xs
+          (let ((parts (split xs)))
+            (merge (mergesort (car parts)) (mergesort (cdr parts)))))))
+(car (mergesort (cons 4 (cons 1 (cons 3 (cons 2 ()))))))
