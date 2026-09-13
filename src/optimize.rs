@@ -17,6 +17,10 @@ pub struct Options {
     /// Number of scalar tail-recursion iterations to place in one emitted
     /// Bend function body. `1` leaves recursion unchanged.
     pub tail_unroll: usize,
+    /// Substitute literal `let` bindings into their uses so that conditions
+    /// over them can fold. Without this, an inlined constant argument stays a
+    /// variable read and both branches survive into the emitted Bend.
+    pub constant_propagation: bool,
 }
 
 impl Default for Options {
@@ -25,6 +29,7 @@ impl Default for Options {
             inline_helpers: true,
             common_subexpressions: true,
             tail_unroll: 4,
+            constant_propagation: true,
         }
     }
 }
@@ -56,13 +61,13 @@ pub fn optimize(mut program: Program, options: Options) -> Program {
     }
 
     for definition in &mut program.definitions {
-        definition.body = simplify(definition.body.clone());
+        definition.body = settle(definition.body.clone(), options.constant_propagation);
         if options.common_subexpressions {
             definition.body = share_common(definition.body.clone(), &mut fresh);
         }
     }
     if let Some(body) = program.body.take() {
-        let body = simplify(body);
+        let body = settle(body, options.constant_propagation);
         program.body = Some(if options.common_subexpressions {
             share_common(body, &mut fresh)
         } else {
@@ -370,6 +375,204 @@ fn clone_with_renaming(
     }
 }
 
+/// Run simplification and literal propagation to a bounded fixed point.
+///
+/// The two interact: folding exposes new literal bindings, and propagation
+/// exposes new foldable conditions.
+fn settle(expr: Expr, propagate: bool) -> Expr {
+    let mut expr = expr;
+    for _ in 0..4 {
+        let before = expr.clone();
+        if propagate {
+            expr = substitute_literal_bindings(expr);
+            expr = drop_unused_bindings(expr);
+        }
+        expr = simplify(expr);
+        if expr == before {
+            break;
+        }
+    }
+    expr
+}
+
+fn is_literal(expr: &Expr) -> bool {
+    matches!(expr, Expr::Number(_) | Expr::Bool(_))
+}
+
+fn map_children(expr: Expr, f: impl Fn(Expr) -> Expr) -> Expr {
+    match expr {
+        Expr::Primitive { op, args } => Expr::Primitive {
+            op,
+            args: args.into_iter().map(&f).collect(),
+        },
+        Expr::Call { callee, args } => Expr::Call {
+            callee,
+            args: args.into_iter().map(&f).collect(),
+        },
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Expr::If {
+            condition: Box::new(f(*condition)),
+            then_branch: Box::new(f(*then_branch)),
+            else_branch: Box::new(f(*else_branch)),
+        },
+        Expr::Let { bindings, body } => Expr::Let {
+            bindings: bindings
+                .into_iter()
+                .map(|(name, value)| (name, f(value)))
+                .collect(),
+            body: Box::new(f(*body)),
+        },
+        Expr::Cons(head, tail) => Expr::Cons(Box::new(f(*head)), Box::new(f(*tail))),
+        Expr::Car(value) => Expr::Car(Box::new(f(*value))),
+        Expr::Cdr(value) => Expr::Cdr(Box::new(f(*value))),
+        Expr::Null(value) => Expr::Null(Box::new(f(*value))),
+        leaf => leaf,
+    }
+}
+
+fn replace_vars(expr: Expr, values: &BTreeMap<String, Expr>) -> Expr {
+    if values.is_empty() {
+        return expr;
+    }
+    match expr {
+        Expr::Var(name) => values.get(&name).cloned().unwrap_or(Expr::Var(name)),
+        other => map_children(other, |child| replace_vars(child, values)),
+    }
+}
+
+/// Replace literal-valued `let` bindings with the literal at each use site.
+///
+/// The inliner already substitutes constant arguments, but it leaves them as
+/// bindings, so a condition such as `if mode` remains a variable read and never
+/// folds -- both arms survive into the emitted Bend. Literals are immediates in
+/// HVM, so copying one to each use site is free, and removing the binding also
+/// removes a copy. Names are already alpha-renamed, so no shadowing is possible.
+fn substitute_literal_bindings(expr: Expr) -> Expr {
+    match expr {
+        Expr::Let { bindings, body } => {
+            let mut literals = BTreeMap::new();
+            let mut kept = Vec::new();
+            for (name, value) in bindings {
+                let value = replace_vars(substitute_literal_bindings(value), &literals);
+                if is_literal(&value) {
+                    literals.insert(name, value);
+                } else {
+                    kept.push((name, value));
+                }
+            }
+            let body = substitute_literal_bindings(replace_vars(*body, &literals));
+            if kept.is_empty() {
+                body
+            } else {
+                Expr::Let {
+                    bindings: kept,
+                    body: Box::new(body),
+                }
+            }
+        }
+        other => map_children(other, substitute_literal_bindings),
+    }
+}
+
+/// Whether dropping a computation as unused is guaranteed safe.
+///
+/// Calls are excluded because removing one could change termination, and
+/// division is excluded because removing one could delete an error the original
+/// program performed. Anything else here is total and side-effect free.
+fn droppable(expr: &Expr) -> bool {
+    match expr {
+        Expr::Number(_) | Expr::Bool(_) | Expr::Var(_) | Expr::Nil => true,
+        Expr::Primitive {
+            op: Primitive::Div, ..
+        } => false,
+        Expr::Primitive { args, .. } => args.iter().all(droppable),
+        _ => false,
+    }
+}
+
+fn collect_uses(expr: &Expr, names: &mut BTreeSet<String>) {
+    match expr {
+        Expr::Var(name) => {
+            names.insert(name.clone());
+        }
+        Expr::Call { callee, args } => {
+            names.insert(callee.clone());
+            for arg in args {
+                collect_uses(arg, names);
+            }
+        }
+        Expr::Primitive { args, .. } => {
+            for arg in args {
+                collect_uses(arg, names);
+            }
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_uses(condition, names);
+            collect_uses(then_branch, names);
+            collect_uses(else_branch, names);
+        }
+        Expr::Let { bindings, body } => {
+            for (_, value) in bindings {
+                collect_uses(value, names);
+            }
+            collect_uses(body, names);
+        }
+        Expr::Cons(head, tail) => {
+            collect_uses(head, names);
+            collect_uses(tail, names);
+        }
+        Expr::Car(value) | Expr::Cdr(value) | Expr::Null(value) => collect_uses(value, names),
+        Expr::Number(_) | Expr::Bool(_) | Expr::Nil => {}
+    }
+}
+
+/// Drop `let` bindings that nothing references any more.
+///
+/// Folding a branch can strand the bindings that only fed the dead arm; leaving
+/// them would keep computing work the program no longer needs.
+fn drop_unused_bindings(expr: Expr) -> Expr {
+    match expr {
+        Expr::Let { bindings, body } => {
+            let body = drop_unused_bindings(*body);
+            let mut kept = bindings
+                .into_iter()
+                .map(|(name, value)| (name, drop_unused_bindings(value)))
+                .collect::<Vec<_>>();
+            loop {
+                let mut used = BTreeSet::new();
+                collect_uses(&body, &mut used);
+                for (_, value) in &kept {
+                    collect_uses(value, &mut used);
+                }
+                let before = kept.len();
+                kept = kept
+                    .into_iter()
+                    .filter(|(name, value)| used.contains(name) || !droppable(value))
+                    .collect();
+                if kept.len() == before {
+                    break;
+                }
+            }
+            if kept.is_empty() {
+                body
+            } else {
+                Expr::Let {
+                    bindings: kept,
+                    body: Box::new(body),
+                }
+            }
+        }
+        other => map_children(other, drop_unused_bindings),
+    }
+}
+
 fn simplify(expr: Expr) -> Expr {
     match expr {
         Expr::Primitive { op, args } => {
@@ -387,6 +590,10 @@ fn simplify(expr: Expr) -> Expr {
             match condition {
                 Expr::Bool(true) => then_branch,
                 Expr::Bool(false) => else_branch,
+                // Bend's `if` is a switch: 0 is false and every other number
+                // -- including a negative I24 -- is true.
+                Expr::Number(number) if number == 0 => else_branch,
+                Expr::Number(_) => then_branch,
                 condition => Expr::If {
                     condition: Box::new(condition),
                     then_branch: Box::new(then_branch),
@@ -713,6 +920,82 @@ mod tests {
             &mut fresh,
         );
         assert!(matches!(optimized, Expr::Let { .. }));
+    }
+
+    #[test]
+    fn propagates_literals_so_constant_branches_fold() {
+        // Mirrors what the inliner produces: `mode` becomes a literal binding.
+        let body = Expr::Let {
+            bindings: vec![
+                ("x".into(), Expr::Var("arg".into())),
+                ("mode".into(), Expr::Number(1)),
+            ],
+            body: Box::new(Expr::If {
+                condition: Box::new(Expr::Var("mode".into())),
+                then_branch: Box::new(Expr::Primitive {
+                    op: Primitive::Add,
+                    args: vec![Expr::Var("x".into()), Expr::Number(1)],
+                }),
+                else_branch: Box::new(Expr::Primitive {
+                    op: Primitive::Mul,
+                    args: vec![Expr::Var("x".into()), Expr::Number(10)],
+                }),
+            }),
+        };
+        let optimized = settle(body, true);
+        assert!(!format!("{optimized:?}").contains("Mul"));
+        assert!(!format!("{optimized:?}").contains("mode"));
+    }
+
+    #[test]
+    fn folds_if_on_a_numeric_condition() {
+        let body = Expr::If {
+            condition: Box::new(Expr::Number(-5)),
+            then_branch: Box::new(Expr::Number(1)),
+            else_branch: Box::new(Expr::Number(2)),
+        };
+        assert_eq!(settle(body.clone(), true), Expr::Number(1));
+        let zero = Expr::If {
+            condition: Box::new(Expr::Number(0)),
+            then_branch: Box::new(Expr::Number(1)),
+            else_branch: Box::new(Expr::Number(2)),
+        };
+        assert_eq!(settle(zero, true), Expr::Number(2));
+    }
+
+    #[test]
+    fn drops_unused_bindings_but_keeps_calls_and_division() {
+        // Unused and cheap: dropped.
+        let cheap = Expr::Let {
+            bindings: vec![("dead".into(), Expr::Number(7))],
+            body: Box::new(Expr::Number(1)),
+        };
+        assert_eq!(drop_unused_bindings(cheap), Expr::Number(1));
+        // Unused but calls a function: kept, because dropping could change
+        // termination.
+        let calling = Expr::Let {
+            bindings: vec![(
+                "dead".into(),
+                Expr::Call {
+                    callee: "f".into(),
+                    args: vec![],
+                },
+            )],
+            body: Box::new(Expr::Number(1)),
+        };
+        assert!(matches!(drop_unused_bindings(calling), Expr::Let { .. }));
+        // Unused but divides: kept, because dropping could delete an error.
+        let dividing = Expr::Let {
+            bindings: vec![(
+                "dead".into(),
+                Expr::Primitive {
+                    op: Primitive::Div,
+                    args: vec![Expr::Number(1), Expr::Number(0)],
+                },
+            )],
+            body: Box::new(Expr::Number(1)),
+        };
+        assert!(matches!(drop_unused_bindings(dividing), Expr::Let { .. }));
     }
 
     #[test]

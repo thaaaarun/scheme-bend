@@ -21,14 +21,36 @@ fn compiles_the_correctness_corpus() {
 
 #[test]
 fn desugars_immediate_lambda_and_emits_let() {
-    let output = compile("((lambda (x) (+ x x)) 21)").unwrap();
-    assert!(output.contains("s_schemeLocal0_95_x = +21"));
-    assert!(output.contains("return (s_schemeLocal0_95_x + s_schemeLocal0_95_x)"));
+    // `rec` cannot be inlined, so its result stays opaque and the immediately
+    // invoked lambda still desugars to a `let`. A literal argument would be
+    // propagated and the body folded away, which is correct but would not
+    // exercise the desugaring.
+    let output = compile(
+        "(define (rec n) (if (= n 0) 0 (+ 1 (rec (- n 1)))))\n\
+         ((lambda (x) (+ x x)) (rec 3))",
+    )
+    .unwrap();
+    assert!(
+        output.contains("s_schemeLocal1_95_x = s_rec(+3)"),
+        "{output}"
+    );
+    assert!(
+        output.contains("return (s_schemeLocal1_95_x + s_schemeLocal1_95_x)"),
+        "{output}"
+    );
 }
 
 #[test]
 fn compiles_nested_control_flow_and_signed_i24_arithmetic() {
-    let output = compile("(let ((x (if #t -7 2))) (if (< x +0) (/ x 2) 0))").unwrap();
+    // Again the argument is opaque, so the branch cannot fold at compile time.
+    let output = compile(
+        "(define (rec n) (if (= n 0) 0 (+ 1 (rec (- n 1)))))\n\
+         (define (f n)\n\
+           (let ((x (if (< n +0) -7 2)))\n\
+             (if (< x +0) (/ x 2) 0)))\n\
+         (f (rec 3))",
+    )
+    .unwrap();
     assert!(!output.contains("statement-only expression"));
     assert!(output.contains("-7"));
     assert!(output.contains("+0"));
@@ -52,29 +74,47 @@ fn unrolls_a_closed_scalar_tail_recurrence() {
     // One recursive call remains after four source iterations are fused into
     // the same ordinary Bend function body, plus the initial call from main.
     assert_eq!(output.matches("return s_sum(").count(), 2);
-    // Countdown tests lower to native `switch`, so each fused iteration shows
-    // up as one switch arm rather than a comparison plus a branch.
-    assert!(output.matches("switch ").count() >= 4);
-    assert!(!output.contains("== "));
+    // Each fused iteration keeps its own exit test.
+    assert!(output.matches("if (").count() >= 4);
 }
 
 #[test]
-fn lowers_a_zero_test_to_a_native_switch() {
+fn never_emits_bend_switch_for_signed_values() {
+    // Bend's `switch` is a U24 construct and its arms do not preserve I24
+    // tags, so a value returned from one silently becomes unsigned and later
+    // signed comparisons are wrong. Verified directly against bend-lang
+    // 0.2.38: a hand-written `switch` returns 16777208 where the equivalent
+    // `if` returns -8. The emitter must therefore stay on `if`.
     let output = compile("(define (count n) (if (= n 0) 0 (count (- n 1))))\n(count 3)").unwrap();
-    assert!(output.contains("switch s_schemeLocal0_95_n:"));
-    assert!(output.contains("case 0:"));
-    assert!(output.contains("case _:"));
-    // The `_` arm receives a predecessor binding for the switched variable,
-    // so the decrement costs nothing.
-    assert!(output.contains("s_schemeLocal0_95_n-1"));
+    assert!(!output.contains("switch "), "{output}");
+    assert!(output.contains("if ("), "{output}");
 }
 
 #[test]
-fn keeps_ordinary_conditionals_as_if() {
-    // Only `(= x 0)` is switchable; other tests keep the comparison.
-    let output = compile("(define (f n) (if (< n 2) n 0))\n(f 5)").unwrap();
-    assert!(output.contains("if "));
-    assert!(!output.contains("switch "));
+fn propagates_constants_and_folds_the_dead_branch() {
+    // The inliner substitutes `mode`, leaving a literal `let`; propagation then
+    // folds the `if`, so the branch and its `* 10` arm leave the emitted body
+    // instead of surviving as a runtime test.
+    let output = compile(
+        "(define (pick x mode) (if mode (+ x 1) (* x 10)))\n\
+         (define (f n) (pick n +1))\n\
+         (f 5)",
+    )
+    .unwrap();
+    let f = output.split("def s_f").nth(1).expect("s_f was not emitted");
+    let f = f.split("def main").next().unwrap();
+    assert!(!f.contains('*'), "dead arm survived: {f}");
+    assert!(f.contains("+ +1"), "{f}");
+}
+
+#[test]
+fn folds_a_closed_constant_program() {
+    // With every input known, the cascade runs to a single literal.
+    assert!(
+        compile("((lambda (x) (* x x)) 21)")
+            .unwrap()
+            .contains("return +441")
+    );
 }
 
 #[test]

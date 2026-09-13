@@ -12,6 +12,7 @@ fn main() -> ExitCode {
                     inline_helpers: false,
                     common_subexpressions: false,
                     tail_unroll: 1,
+                    constant_propagation: false,
                 };
             }
             "--tail-unroll" => {
@@ -27,6 +28,7 @@ fn main() -> ExitCode {
                 }
             }
             "--no-cse" => options.common_subexpressions = false,
+            "--no-const-prop" => options.constant_propagation = false,
             "--help" | "-h" => return usage(),
             _ if argument.starts_with('-') => {
                 eprintln!("scheme-bend: unknown option `{argument}`");
@@ -61,6 +63,8 @@ fn main() -> ExitCode {
 }
 
 fn usage() -> ExitCode {
-    eprintln!("usage: scheme-bend [--no-opt] [--no-cse] [--tail-unroll 1..8] <input.scm>");
+    eprintln!(
+        "usage: scheme-bend [--no-opt] [--no-cse] [--no-const-prop] [--tail-unroll 1..8] <input.scm>"
+    );
     ExitCode::from(2)
 }

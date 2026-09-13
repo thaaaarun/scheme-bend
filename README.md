@@ -22,13 +22,21 @@ Bend toolchain. Example programs live in `examples/`.
 The default compiler pipeline performs Bend-only source optimization before
 rendering: it inlines small direct helpers, shares repeated total numeric
 expressions, and unrolls eligible closed scalar tail recurrences four times.
-Codegen additionally lowers `(= x 0)` tests in tail position to Bend's native
-numeric `switch`, which drops the compare interaction and hands the `_` arm a
-free predecessor binding for `x`. Those are ordinary Bend constructs, not an
-HVM fork or an FFI escape hatch.
+It also propagates literal `let` bindings into their uses so that conditions
+over them fold; without this an inlined constant argument stays a variable read
+and every branch survives into the emitted Bend.
+Those are ordinary Bend constructs, not an HVM fork or an FFI escape hatch.
 Use `--no-opt` for direct lowering, `--no-cse` to evaluate recomputation rather
-than sharing, or `--tail-unroll 1` to keep inlining/CSE while disabling
-recurrence specialization.
+than sharing, `--no-const-prop` to disable literal propagation, or
+`--tail-unroll 1` to keep inlining/CSE while disabling recurrence
+specialization.
+
+Deliberately *not* used: Bend's `switch`. It is a U24 construct and its arms do
+not preserve I24 tags, so a value returned from one silently becomes unsigned
+and later signed comparisons are wrong. Measured directly against bend-lang
+0.2.38, a hand-written `switch` returns `16777208` where the equivalent `if`
+returns `-8`. The emitter therefore stays on `if`, and a regression test pins
+this.
 
 ## Supported subset
 
@@ -124,10 +132,10 @@ helps measurably is reducing the number of those interactions in emitted Bend:
   `benchmarks/mandelbrot.scm` exercise this path.
 - Specializing a closed scalar recurrence into four ordinary Bend iterations
   removes three of every four recursive call expansions.
-- Lowering a zero test to native `switch` removes both the compare and, via the
-  predecessor binding, the decrement. A 20,000-iteration accumulator loop in
-  Scheme drops from 310,013 to 170,007 interactions (about 45%) with an
-  unchanged result.
+- Propagating literal `let` bindings lets a constant branch fold instead of
+  being re-tested at runtime. On a loop that calls a small helper with a
+  constant mode argument, interactions drop from 470,013 to 310,013 (about 34%)
+  with an unchanged result, exactly matching a hand-specialized version.
 
 These are local source-level fixes; ordinary Bend still evaluates each dynamic
 arithmetic primitive as an interaction.
