@@ -117,10 +117,18 @@ impl Emitter {
     /// splits the node and its children immediately and the copy cascades down
     /// the spine: one spine copy per element makes traversal O(N^2).
     ///
-    /// It is worse when two lists are walked in lockstep, as in a dot product
-    /// or a merge: binding only the *tested* variable left the other list
-    /// copied once per element, which is what kept those loops quadratic.
-    #[allow(clippy::too_many_arguments)]
+    /// Each list is therefore bound once. Two cases matter:
+    ///
+    /// * Several lists walked in lockstep (a dot product, a merge) -- each gets
+    ///   its own nested `match`.
+    /// * Several elements of the *same* list consumed per call, written as
+    ///   `(cdr (cdr x))` and friends -- handled by following the cdr spine:
+    ///   bind `x.tail`, then `match` it to reach *its* head and tail, and so
+    ///   on. That also amortises the per-element call, which is most of what a
+    ///   list step costs.
+    ///
+    /// An exhausted list falls back to the accessor sentinels in its `Nil` arm,
+    /// which is exactly what `scheme_car`/`scheme_cdr` return for `Nil`.
     fn emit_list_match(
         &mut self,
         plan: &Destructure,
@@ -130,65 +138,106 @@ impl Emitter {
         globals: &BTreeSet<String>,
         out: &mut String,
     ) {
-        let pad = "  ".repeat(depth);
-        let switched = mangle(&plan.primary);
-        // Keep the IR-side names unmangled: `emit_value` mangles variables when
-        // it renders them, so the binding line has to mangle to match.
-        let mut bound: Vec<(String, Option<Expr>, Option<Expr>)> = vec![(
-            plan.primary.clone(),
-            plan.primary_head.clone().map(Expr::Var),
-            plan.primary_tail.clone().map(Expr::Var),
-        )];
-        out.push_str(&format!("{pad}match {switched}:\n"));
-        out.push_str(&format!("{pad}  case SchemeList/Nil:\n"));
-        self.emit_return(then_branch, depth + 2, globals, out);
-        out.push_str(&format!("{pad}  case SchemeList/Cons:\n"));
-        if let Some(h) = &plan.primary_head {
-            out.push_str(&format!("{0}    {1} = {switched}.head\n", pad, mangle(h)));
-        }
-        if let Some(t) = &plan.primary_tail {
-            out.push_str(&format!("{0}    {1} = {switched}.tail\n", pad, mangle(t)));
-        }
+        let names: Vec<String> = plan.roots.iter().map(|r| r.name.clone()).collect();
+        self.emit_root(
+            plan,
+            &names,
+            0,
+            0,
+            &[],
+            then_branch,
+            else_branch,
+            depth,
+            globals,
+            out,
+        );
+    }
 
-        match &plan.secondary {
-            None => {
-                let body = substitute_accessors(else_branch, &bound);
-                self.emit_return(&body, depth + 2, globals, out);
-            }
-            Some((name, head, tail)) => {
-                out.push_str(&format!("{0}    match {1}:\n", pad, mangle(name)));
-                // An exhausted second list falls back to the accessor
-                // sentinels, which is exactly what scheme_car/scheme_cdr give.
-                out.push_str(&format!("{0}      case SchemeList/Nil:\n", pad));
-                let mut nil_bound = bound.clone();
-                nil_bound.push((name.clone(), Some(Expr::Number(0)), Some(Expr::Nil)));
-                let nil_body = substitute_accessors(else_branch, &nil_bound);
-                self.emit_return(&nil_body, depth + 4, globals, out);
-                out.push_str(&format!("{0}      case SchemeList/Cons:\n", pad));
-                if let Some(h) = head {
-                    out.push_str(&format!(
-                        "{0}        {1} = {2}.head\n",
-                        pad,
-                        mangle(h),
-                        mangle(name)
-                    ));
-                }
-                if let Some(t) = tail {
-                    out.push_str(&format!(
-                        "{0}        {1} = {2}.tail\n",
-                        pad,
-                        mangle(t),
-                        mangle(name)
-                    ));
-                }
-                bound.push((
-                    name.clone(),
-                    head.clone().map(Expr::Var),
-                    tail.clone().map(Expr::Var),
-                ));
-                let body = substitute_accessors(else_branch, &bound);
-                self.emit_return(&body, depth + 4, globals, out);
-            }
+    /// Emits the spine `match` at `level` for root `root_idx`, then descends.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_root(
+        &mut self,
+        plan: &Destructure,
+        names: &[String],
+        root_idx: usize,
+        level: usize,
+        bound: &[Binding],
+        then_branch: &Expr,
+        else_branch: &Expr,
+        depth: usize,
+        globals: &BTreeSet<String>,
+        out: &mut String,
+    ) {
+        let root = &plan.roots[root_idx];
+        let max_level = root.match_depth();
+        let node = mangle(&root.node_name(level));
+        let pad = "  ".repeat(depth);
+        let inner = "  ".repeat(depth + 2);
+        out.push_str(&format!("{pad}match {node}:\n"));
+        out.push_str(&format!("{pad}  case SchemeList/Nil:\n"));
+        if root.tested && level == 0 {
+            // The list is empty: this is the branch the `if` selected.
+            self.emit_return(then_branch, depth + 2, globals, out);
+        } else {
+            // The list ended partway down the spine. Every access from here on
+            // sees Nil, which is what the accessor sentinels model.
+            let mut nil_bound = bound.to_vec();
+            nil_bound.extend(root.sentinels(root_idx, level));
+            let body = substitute_accessors(else_branch, names, &nil_bound);
+            self.emit_return(&body, depth + 2, globals, out);
+        }
+        out.push_str(&format!("{pad}  case SchemeList/Cons:\n"));
+        let mut cons_bound = bound.to_vec();
+        if root.head_depths.contains(&level) {
+            let name = root.head_name(level);
+            out.push_str(&format!("{inner}{} = {node}.head\n", mangle(&name)));
+            cons_bound.push(Binding {
+                root: root_idx,
+                depth: level,
+                head: true,
+                value: Expr::Var(name),
+            });
+        }
+        let descend = level < max_level;
+        if descend || root.tail_depths.contains(&(level + 1)) {
+            let name = root.node_name(level + 1);
+            out.push_str(&format!("{inner}{} = {node}.tail\n", mangle(&name)));
+            cons_bound.push(Binding {
+                root: root_idx,
+                depth: level + 1,
+                head: false,
+                value: Expr::Var(name),
+            });
+        }
+        if descend {
+            self.emit_root(
+                plan,
+                names,
+                root_idx,
+                level + 1,
+                &cons_bound,
+                then_branch,
+                else_branch,
+                depth + 2,
+                globals,
+                out,
+            );
+        } else if root_idx + 1 < plan.roots.len() {
+            self.emit_root(
+                plan,
+                names,
+                root_idx + 1,
+                0,
+                &cons_bound,
+                then_branch,
+                else_branch,
+                depth + 2,
+                globals,
+                out,
+            );
+        } else {
+            let body = substitute_accessors(else_branch, names, &cons_bound);
+            self.emit_return(&body, depth + 2, globals, out);
         }
     }
 
@@ -283,61 +332,235 @@ fn null_test_variable(condition: &Expr) -> Option<&str> {
     }
 }
 
-/// The list variables one `match` binds.
-struct Destructure {
-    /// The variable named by the test; its `Nil` arm is the original `then`.
-    primary: String,
-    primary_head: Option<String>,
-    primary_tail: Option<String>,
-    /// A second list walked in lockstep, when one qualifies.
-    secondary: Option<(String, Option<String>, Option<String>)>,
+/// One list variable the emitter binds, and how far down its cdr spine the
+/// branch reaches.
+struct RootPlan {
+    name: String,
+    /// Chain depths (number of `cdr`s applied) at which a head is read.
+    head_depths: Vec<usize>,
+    /// Chain depths at which the tail is taken.
+    tail_depths: Vec<usize>,
+    /// True for the variable named by the test, whose `Nil` arm is the original
+    /// then-branch rather than a sentinel fallback.
+    tested: bool,
 }
+
+impl RootPlan {
+    fn head_name(&self, level: usize) -> String {
+        format!("{}_h{}", self.name, level)
+    }
+    /// The node at a chain depth: depth 0 is the variable itself.
+    fn node_name(&self, level: usize) -> String {
+        if level == 0 {
+            self.name.clone()
+        } else {
+            format!("{}_t{}", self.name, level)
+        }
+    }
+    /// The deepest spine `match` this root needs. A head at depth k needs the
+    /// node at depth k matched; a tail at depth k needs depth k-1 matched.
+    fn match_depth(&self) -> usize {
+        let head = self.head_depths.iter().copied().max().unwrap_or(0);
+        let tail = self
+            .tail_depths
+            .iter()
+            .map(|k| k.saturating_sub(1))
+            .max()
+            .unwrap_or(0);
+        head.max(tail)
+    }
+    /// What every access from `level` down evaluates to once the list is Nil.
+    fn sentinels(&self, root: usize, level: usize) -> Vec<Binding> {
+        let mut out = Vec::new();
+        for depth in level..=self.match_depth() {
+            out.push(Binding {
+                root,
+                depth,
+                head: true,
+                value: Expr::Number(0),
+            });
+        }
+        for depth in (level + 1)..=(self.match_depth() + 1) {
+            out.push(Binding {
+                root,
+                depth,
+                head: false,
+                value: Expr::Nil,
+            });
+        }
+        out
+    }
+}
+
+/// A resolved accessor chain, keyed by root index and `cdr` count.
+#[derive(Clone)]
+struct Binding {
+    root: usize,
+    depth: usize,
+    head: bool,
+    value: Expr,
+}
+
+struct Destructure {
+    roots: Vec<RootPlan>,
+}
+
+/// How many extra lists to bind. Each adds a nested match and one more copy of
+/// the body in its exhausted arm, so this is deliberately bounded.
+const MAX_SECONDARIES: usize = 4;
 
 /// Plans a destructuring `match`, or declines.
 ///
-/// A variable qualifies only when it is used *solely* as `(car x)` / `(cdr x)`
-/// in the cons branch and not at all in the nil branch: any other use would
-/// itself need a copy, which is the cost this rewrite exists to remove.
+/// A variable is bound only when every use of it is the base of a `car`/`cdr`
+/// chain and it is not touched in the nil branch: any other use would itself
+/// need a copy, which is the cost this rewrite exists to remove.
 fn plan_destructure(tested: &str, then_branch: &Expr, else_branch: &Expr) -> Option<Destructure> {
-    let targets = |name: &str| -> Option<(Option<String>, Option<String>)> {
-        if uses_variable(then_branch, name) {
-            return None;
-        }
-        let mut head = false;
-        let mut tail = false;
-        if !scan_accessors(else_branch, name, &mut head, &mut tail) || (!head && !tail) {
-            return None;
-        }
-        Some((
-            head.then(|| format!("{name}_head")),
-            tail.then(|| format!("{name}_tail")),
-        ))
-    };
-
-    let (primary_head, primary_tail) = targets(tested)?;
-
     // A variable bound by a `let` *inside* a branch is not in scope at the
     // `if`, so binding it with a hoisted match would reference it before it
-    // exists. (Such a variable can still be bound by a match at a nested `if`
-    // that sits within its own scope.)
+    // exists.
     let mut inner_locals = Vec::new();
     collect_let_bound(then_branch, &mut inner_locals);
     collect_let_bound(else_branch, &mut inner_locals);
 
+    let mut roots = vec![RootPlan {
+        name: tested.to_owned(),
+        head_depths: Vec::new(),
+        tail_depths: Vec::new(),
+        tested: true,
+    }];
     let mut candidates = Vec::new();
-    collect_accessor_vars(else_branch, &mut candidates);
-    let secondary = candidates
-        .into_iter()
-        .filter(|name| name != tested && !inner_locals.contains(name))
-        .filter_map(|name| targets(&name).map(|(h, t)| (name, h, t)))
-        .max_by_key(|(_, h, t)| h.is_some() as usize + t.is_some() as usize);
+    collect_list_roots(else_branch, &mut candidates);
+    for candidate in candidates {
+        if roots.len() > MAX_SECONDARIES {
+            break;
+        }
+        if candidate == tested
+            || inner_locals.contains(&candidate)
+            || uses_variable(then_branch, &candidate)
+            || !only_chained_uses(else_branch, &candidate)
+        {
+            continue;
+        }
+        roots.push(RootPlan {
+            name: candidate,
+            head_depths: Vec::new(),
+            tail_depths: Vec::new(),
+            tested: false,
+        });
+    }
 
-    Some(Destructure {
-        primary: tested.to_owned(),
-        primary_head,
-        primary_tail,
-        secondary,
-    })
+    let names: Vec<String> = roots.iter().map(|r| r.name.clone()).collect();
+    scan_depths(else_branch, &names, &mut roots);
+    // Nothing is accessed: a plain `if` is simpler than a match.
+    if roots
+        .iter()
+        .all(|r| r.head_depths.is_empty() && r.tail_depths.is_empty())
+    {
+        return None;
+    }
+    Some(Destructure { roots })
+}
+
+/// Resolves a `cdr` chain to (root index, number of `cdr`s).
+fn resolve_tail(expr: &Expr, names: &[String]) -> Option<(usize, usize)> {
+    match expr {
+        Expr::Var(v) => names.iter().position(|n| n == v).map(|i| (i, 0)),
+        Expr::Cdr(inner) => {
+            let (i, k) = resolve_tail(inner, names)?;
+            Some((i, k + 1))
+        }
+        _ => None,
+    }
+}
+
+/// Resolves `(car chain)` / `(cdr chain)` to (root index, `cdr` count, is_head).
+fn resolve_accessor(expr: &Expr, names: &[String]) -> Option<(usize, usize, bool)> {
+    match expr {
+        Expr::Car(inner) => resolve_tail(inner, names).map(|(i, k)| (i, k, true)),
+        Expr::Cdr(inner) => resolve_tail(inner, names).map(|(i, k)| (i, k + 1, false)),
+        _ => None,
+    }
+}
+
+/// True when `expr` is `car`/`cdr` applied to a `cdr` chain rooted at `name`.
+fn valid_chain(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Car(inner) | Expr::Cdr(inner) => tail_chain_name(inner).as_deref() == Some(name),
+        _ => false,
+    }
+}
+
+fn tail_chain_name(expr: &Expr) -> Option<String> {
+    match expr {
+        Expr::Var(v) => Some(v.clone()),
+        Expr::Cdr(inner) => tail_chain_name(inner),
+        _ => None,
+    }
+}
+
+/// True when every occurrence of `name` is the base of a `car`/`cdr` chain.
+fn only_chained_uses(expr: &Expr, name: &str) -> bool {
+    if let Expr::Var(v) = expr {
+        return v != name;
+    }
+    if matches!(expr, Expr::Car(_) | Expr::Cdr(_)) && valid_chain(expr, name) {
+        return true;
+    }
+    children(expr).iter().all(|c| only_chained_uses(c, name))
+}
+
+/// Every variable appearing as the base of a `car`/`cdr` chain.
+fn collect_list_roots(expr: &Expr, out: &mut Vec<String>) {
+    if matches!(expr, Expr::Car(_) | Expr::Cdr(_)) {
+        if let Some(name) = match expr {
+            Expr::Car(inner) | Expr::Cdr(inner) => tail_chain_name(inner),
+            _ => None,
+        } {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+    }
+    for child in children(expr) {
+        collect_list_roots(child, out);
+    }
+}
+
+/// Records, per root, the chain depths at which heads and tails are read.
+fn scan_depths(expr: &Expr, names: &[String], roots: &mut [RootPlan]) {
+    if let Some((i, k, is_head)) = resolve_accessor(expr, names) {
+        let list = if is_head {
+            &mut roots[i].head_depths
+        } else {
+            &mut roots[i].tail_depths
+        };
+        if !list.contains(&k) {
+            list.push(k);
+        }
+        return;
+    }
+    for child in children(expr) {
+        scan_depths(child, names, roots);
+    }
+}
+
+fn children(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Primitive { args, .. } | Expr::Call { args, .. } => args.iter().collect(),
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => vec![condition, then_branch, else_branch],
+        Expr::Let { bindings, body } => bindings
+            .iter()
+            .map(|(_, v)| v)
+            .chain(std::iter::once(&**body))
+            .collect(),
+        Expr::Cons(a, b) => vec![a, b],
+        Expr::Car(v) | Expr::Cdr(v) | Expr::Null(v) => vec![v],
+        Expr::Var(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Nil => Vec::new(),
+    }
 }
 
 /// Every variable bound by a `let` anywhere inside `expr`.
@@ -373,46 +596,6 @@ fn collect_let_bound(expr: &Expr, out: &mut Vec<String>) {
     }
 }
 
-/// Every variable appearing as `(car x)` or `(cdr x)`.
-fn collect_accessor_vars(expr: &Expr, out: &mut Vec<String>) {
-    match expr {
-        Expr::Car(inner) | Expr::Cdr(inner) => {
-            if let Expr::Var(name) = &**inner {
-                if !out.iter().any(|n| n == name) {
-                    out.push(name.clone());
-                }
-            }
-            collect_accessor_vars(inner, out);
-        }
-        Expr::Primitive { args, .. } | Expr::Call { args, .. } => {
-            for arg in args {
-                collect_accessor_vars(arg, out);
-            }
-        }
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-        } => {
-            collect_accessor_vars(condition, out);
-            collect_accessor_vars(then_branch, out);
-            collect_accessor_vars(else_branch, out);
-        }
-        Expr::Let { bindings, body } => {
-            for (_, value) in bindings {
-                collect_accessor_vars(value, out);
-            }
-            collect_accessor_vars(body, out);
-        }
-        Expr::Cons(a, b) => {
-            collect_accessor_vars(a, out);
-            collect_accessor_vars(b, out);
-        }
-        Expr::Null(v) => collect_accessor_vars(v, out),
-        Expr::Var(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Nil => {}
-    }
-}
-
 /// True when `name` occurs anywhere in `expr`.
 fn uses_variable(expr: &Expr, name: &str) -> bool {
     match expr {
@@ -438,70 +621,17 @@ fn uses_variable(expr: &Expr, name: &str) -> bool {
     }
 }
 
-/// Records which accessors are applied to `name`, and rejects any other use.
-/// Returns false when the variable is used in a way this rewrite cannot handle.
-fn scan_accessors(expr: &Expr, name: &str, head: &mut bool, tail: &mut bool) -> bool {
-    match expr {
-        Expr::Var(v) if v == name => false,
-        Expr::Car(inner) if matches!(&**inner, Expr::Var(v) if v == name) => {
-            *head = true;
-            true
+/// Replaces each accessor chain with the value planned for it.
+fn substitute_accessors(expr: &Expr, names: &[String], bindings: &[Binding]) -> Expr {
+    if let Some((root, depth, head)) = resolve_accessor(expr, names) {
+        if let Some(b) = bindings
+            .iter()
+            .find(|b| b.root == root && b.depth == depth && b.head == head)
+        {
+            return b.value.clone();
         }
-        Expr::Cdr(inner) if matches!(&**inner, Expr::Var(v) if v == name) => {
-            *tail = true;
-            true
-        }
-        Expr::Primitive { args, .. } | Expr::Call { args, .. } => {
-            args.iter().all(|a| scan_accessors(a, name, head, tail))
-        }
-        Expr::If {
-            condition,
-            then_branch,
-            else_branch,
-        } => {
-            scan_accessors(condition, name, head, tail)
-                && scan_accessors(then_branch, name, head, tail)
-                && scan_accessors(else_branch, name, head, tail)
-        }
-        Expr::Let { bindings, body } => {
-            bindings
-                .iter()
-                .all(|(_, v)| scan_accessors(v, name, head, tail))
-                && scan_accessors(body, name, head, tail)
-        }
-        Expr::Cons(a, b) => {
-            scan_accessors(a, name, head, tail) && scan_accessors(b, name, head, tail)
-        }
-        Expr::Car(v) | Expr::Cdr(v) | Expr::Null(v) => scan_accessors(v, name, head, tail),
-        Expr::Var(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Nil => true,
     }
-}
-
-/// Replaces `(car x)` / `(cdr x)` with the substitute planned for that variable.
-fn substitute_accessors(expr: &Expr, map: &[(String, Option<Expr>, Option<Expr>)]) -> Expr {
-    let lookup = |name: &str, head: bool| -> Option<Expr> {
-        map.iter()
-            .find(|(n, _, _)| n == name)
-            .and_then(|(_, h, t)| if head { h.clone() } else { t.clone() })
-    };
-    match expr {
-        Expr::Car(inner) => {
-            if let Expr::Var(v) = &**inner {
-                if let Some(replacement) = lookup(v, true) {
-                    return replacement;
-                }
-            }
-        }
-        Expr::Cdr(inner) => {
-            if let Expr::Var(v) = &**inner {
-                if let Some(replacement) = lookup(v, false) {
-                    return replacement;
-                }
-            }
-        }
-        _ => {}
-    }
-    map_children(expr, &|child| substitute_accessors(child, map))
+    map_children(expr, &|child| substitute_accessors(child, names, bindings))
 }
 
 fn map_children(expr: &Expr, f: &dyn Fn(&Expr) -> Expr) -> Expr {

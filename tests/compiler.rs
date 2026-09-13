@@ -118,6 +118,31 @@ fn folds_a_closed_constant_program() {
 }
 
 #[test]
+fn binds_every_list_walked_in_lockstep() {
+    // Three lists consumed together must each be bound once. Leaving any of
+    // them as separate car/cdr calls duplicates them per element, and eager
+    // HVM then copies the whole spine, which is quadratic.
+    let output = compile(
+        "(define (zip3 xs ys zs acc)\n\
+           (if (null? xs)\n\
+               acc\n\
+               (zip3 (cdr xs) (cdr ys) (cdr zs) (+ acc (+ (car xs) (+ (car ys) (car zs)))))))\n\
+         (zip3 (cons 1 ()) (cons 2 ()) (cons 3 ()) 0)",
+    )
+    .unwrap();
+    // Scope the checks to the generated function: the prelude has its own
+    // matches and accessor calls.
+    let body = output.split("def s_zip3").nth(1).expect("s_zip3 emitted");
+    // One match for the tested list plus one per additional list.
+    assert_eq!(body.matches("match ").count(), 3, "{body}");
+    // The hot path binds every list once. Accessor calls survive only in the
+    // exhausted-list arms, which fire when the lists differ in length -- there
+    // the sentinels scheme_car/scheme_cdr return are the faithful behaviour.
+    let accessors = body.matches("scheme_car(").count() + body.matches("scheme_cdr(").count();
+    assert!(accessors <= 2, "{accessors} accessor calls:\n{body}");
+}
+
+#[test]
 fn rejects_numbers_outside_the_signed_i24_range() {
     assert!(
         compile("8388608")

@@ -55,11 +55,29 @@
 ; nth-list re-reads the column each time *and* leaves `a` and the transposed
 ; matrix live across both the dot product and the recursive call, so eager HVM
 ; duplicates them once per cell -- measured at 6.8x the interactions.
+(define (dot4 xs y1 y2 y3 y4 a1 a2 a3 a4)
+  (if (null? xs)
+      (+ (+ (* a1 a1) (* a2 a2)) (+ (* a3 a3) (* a4 a4)))
+      (dot4 (cdr xs) (cdr y1) (cdr y2) (cdr y3) (cdr y4)
+            (+ a1 (* (car xs) (car y1)))
+            (+ a2 (* (car xs) (car y2)))
+            (+ a3 (* (car xs) (car y3)))
+            (+ a4 (* (car xs) (car y4))))))
+
+(define (add acc term)
+  (mod- (+ acc (mod- term 3000000)) 3000000))
+
 (define (row-checksum a cols acc)
   (if (null? cols)
       acc
-      (let ((c (dot a (car cols) 0)))
-        (row-checksum a (cdr cols) (mod- (+ acc (mod- (* c c) 3000000)) 3000000)))))
+      (row-checksum a
+                    (cdr (cdr (cdr (cdr cols))))
+                    (add acc (dot4 a
+                                   (car cols)
+                                   (car (cdr cols))
+                                   (car (cdr (cdr cols)))
+                                   (car (cdr (cdr (cdr cols))))
+                                   0 0 0 0)))))
 
 (define (rows-checksum a bt acc)
   (if (null? a)
