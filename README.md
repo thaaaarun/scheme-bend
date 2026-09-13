@@ -21,11 +21,20 @@ Bend toolchain. Example programs live in `examples/`.
 
 The default compiler pipeline performs Bend-only source optimization before
 rendering: it inlines small direct helpers, shares repeated total numeric
-expressions, and unrolls eligible closed scalar tail recurrences four times.
+expressions, and unrolls eligible closed scalar tail recurrences eight times.
 It also propagates literal `let` bindings into their uses so that conditions
 over them fold; without this an inlined constant argument stays a variable read
 and every branch survives into the emitted Bend.
 Those are ordinary Bend constructs, not an HVM fork or an FFI escape hatch.
+
+The emitter binds list variables once as well. Lowering
+`(if (null? xs) base (f (cdr xs) (... (car xs) ...)))` to three separate
+accessor calls uses `xs` three times, and a repeated use costs a DUP node.
+HVM2 is eager, so duplicating a cons cell splits the node *and* its children
+immediately and the copy cascades down the spine: one spine copy per element
+makes traversal O(N^2). Emitting a single `match` that destructures once makes
+it O(N). The same applies to a second list walked in lockstep, as in a dot
+product or a merge, which is bound with a nested `match`.
 Use `--no-opt` for direct lowering, `--no-cse` to evaluate recomputation rather
 than sharing, `--no-const-prop` to disable literal propagation, or
 `--tail-unroll 1` to keep inlining/CSE while disabling recurrence
@@ -84,11 +93,11 @@ deterministic HVM interaction counts:
 |---|---:|
 | direct lowering (`--no-opt`) | 376,421,184 |
 | inline + CSE (`--tail-unroll 1`) | 350,229,884 |
-| 4-way recurrence specialization, without CSE (`--no-cse`) | 262,976,288 |
-| default, including 4-way recurrence specialization | 254,947,156 |
+| 8-way recurrence fusion, without CSE (`--no-cse`) | 249,304,617 |
+| default, including 8-way recurrence fusion | 239,870,882 |
 
 The recurrence pass is deliberately narrow: it only accepts a direct, closed,
-scalar self-tail-call. It emits four ordinary nested Bend iterations and one
+scalar self-tail-call. It emits eight ordinary nested Bend iterations and one
 remaining recursive call, preserving each iteration's exit test. It does not
 attempt a general loop optimizer or change Bend's runtime.
 
@@ -105,6 +114,23 @@ SBCL 2.6.8) are:
 | `fib(34)` (C runtime) | ~0.44 s | ~0.06 s | ~7x |
 | balanced sum 1..1M (standalone C) | ~0.08 s | ~0.02 s | ~4x |
 | Mandelbrot 256x256 (standalone C) | ~0.56 s | ~0.08 s | ~7x |
+
+`benchmarks/suite.sh` covers sixteen programs and reports the deterministic
+interaction count alongside wall clock. The SBCL baselines are *generated* from
+the `.scm` sources by `benchmarks/gen_baseline.py`, so there is one source of
+truth per benchmark and the two cannot drift apart; hand-maintained twins had
+quietly diverged in five of fourteen cases. Several kernels are repeated inside
+one process because a single run finishes below SBCL's ~10ms process startup.
+
+Wall clock needs care in two ways. Benchmark shape decides how much of HVM's
+parallelism is reachable: a divide-and-conquer kernel (matmul, parallel-sum)
+keeps the redex frontier wide and gains ~5-7x from eight threads, while a tight
+accumulator chain has little slack and gains none. And when threads run dry
+HVM calls `sched_yield` on every idle tick and only re-checks for termination
+once per 256 ticks, so a low-slack kernel can burn seconds of system time for
+no gain -- powmod spends 8.5s of kernel time at eight threads versus 0.18s at
+one, with no improvement in wall clock. For sequential kernels the
+single-threaded number is the meaningful one.
 
 `parallel-sum` agrees exactly with its SBCL baseline (checksum 5908768). The
 Mandelbrot checksum above is the signed-I24 version, so it replaces the older
@@ -130,8 +156,22 @@ helps measurably is reducing the number of those interactions in emitted Bend:
 - Inlining small direct helpers keeps hot arithmetic call-free while preserving
   readable Scheme source; `step-re` and `step-im` in
   `benchmarks/mandelbrot.scm` exercise this path.
-- Specializing a closed scalar recurrence into four ordinary Bend iterations
-  removes three of every four recursive call expansions.
+- Specializing a closed scalar recurrence into eight ordinary Bend iterations
+  removes seven of every eight recursive call expansions. The size guard that
+  bounds this was previously too tight to admit a factor above four, so raising
+  it is worth another 6% on Mandelbrot (`--tail-unroll 6/8` used to behave
+  exactly like `1`).
+- But more fusion is not better without limit. On Mandelbrot the interaction
+  count keeps falling to 64-way fusion (254.9M at 4, 239.9M at 8, 226.0M at 64)
+  while median wall clock is 0.50s at 4, 0.49s at 8 and 0.56s at 16. Past
+  roughly eight the larger function body costs more than the saved call
+  expansions return, so interaction count alone is not a safe proxy for speed
+  and the default stops at 8.
+- Binding list variables once instead of calling `car`/`cdr`/`null?`
+  separately. Traversing a list was O(N^2) in interactions and is now O(N):
+  a 2000-element walk fell from 56,176,046 to 92,030. A dot product over two
+  2000-element lists fell from 28,216,050 to 198,050, and the 32x32 matmul
+  benchmark fell from 26.4M to 2.7M interactions per matrix.
 - Propagating literal `let` bindings lets a constant branch fold instead of
   being re-tested at runtime. On a loop that calls a small helper with a
   constant mode argument, interactions drop from 470,013 to 310,013 (about 34%)

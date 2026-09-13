@@ -15,7 +15,15 @@ pub struct Options {
     /// Share repeated total numeric expressions, such as `(* zr zr)`.
     pub common_subexpressions: bool,
     /// Number of scalar tail-recursion iterations to place in one emitted
-    /// Bend function body. `1` leaves recursion unchanged.
+    /// Bend function body. `1` leaves recursion unchanged. More fusion means
+    /// fewer recursive call expansions but a larger emitted function.
+    ///
+    /// Defaults to 8 because that is where wall clock stops improving. On the
+    /// 256x256 Mandelbrot benchmark, interaction count keeps falling all the
+    /// way to 64 (254.9M at 4, 239.9M at 8, 226.0M at 64), but median wall
+    /// clock is 0.50s at 4, 0.49s at 8 and 0.56s at 16: past 8 the larger
+    /// function body costs more than the saved call expansions return. The
+    /// interaction count alone is not a safe proxy for speed.
     pub tail_unroll: usize,
     /// Substitute literal `let` bindings into their uses so that conditions
     /// over them can fold. Without this, an inlined constant argument stays a
@@ -28,7 +36,7 @@ impl Default for Options {
         Self {
             inline_helpers: true,
             common_subexpressions: true,
-            tail_unroll: 4,
+            tail_unroll: 8,
             constant_propagation: true,
         }
     }
@@ -217,9 +225,11 @@ fn unroll_tail_recurrence(definition: &Definition, factor: usize, fresh: &mut Fr
         return definition.body.clone();
     }
     // Bend's net-size guard is expressed in HVM nodes, not source expressions.
-    // This deliberately conservative source estimate keeps generic programs
-    // from exploding while still admitting a four-way numeric recurrence.
-    if expr_size(&definition.body).saturating_mul(factor) > 192 {
+    // This source estimate keeps generic programs from exploding while still
+    // admitting a numeric recurrence at the largest factor the CLI allows.
+    // At 192 an escape-style body of ~33 expressions was silently refused for
+    // factors above four, which left `--tail-unroll 6/8` behaving like `1`.
+    if expr_size(&definition.body).saturating_mul(factor) > 8192 {
         return definition.body.clone();
     }
     expand_tail(

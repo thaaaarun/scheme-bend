@@ -90,6 +90,12 @@ impl Emitter {
                 then_branch,
                 else_branch,
             } => {
+                if let Some(name) = null_test_variable(condition) {
+                    if let Some(plan) = plan_destructure(name, then_branch, else_branch) {
+                        self.emit_list_match(&plan, then_branch, else_branch, depth, globals, out);
+                        return;
+                    }
+                }
                 let condition = self.emit_value(condition, depth, globals, out);
                 out.push_str(&format!("{pad}if {condition}:\n"));
                 self.emit_return(then_branch, depth + 1, globals, out);
@@ -102,6 +108,90 @@ impl Emitter {
             }
         }
     }
+    /// Emit `match` for a list test, binding every list the branch consumes.
+    ///
+    /// The natural lowering of
+    ///     (if (null? xs) base (f (cdr xs) (... (car xs) ...)))
+    /// calls the list accessors separately, so each list is used several times
+    /// and HVM must duplicate it. HVM2 is eager, so duplicating a cons cell
+    /// splits the node and its children immediately and the copy cascades down
+    /// the spine: one spine copy per element makes traversal O(N^2).
+    ///
+    /// It is worse when two lists are walked in lockstep, as in a dot product
+    /// or a merge: binding only the *tested* variable left the other list
+    /// copied once per element, which is what kept those loops quadratic.
+    #[allow(clippy::too_many_arguments)]
+    fn emit_list_match(
+        &mut self,
+        plan: &Destructure,
+        then_branch: &Expr,
+        else_branch: &Expr,
+        depth: usize,
+        globals: &BTreeSet<String>,
+        out: &mut String,
+    ) {
+        let pad = "  ".repeat(depth);
+        let switched = mangle(&plan.primary);
+        // Keep the IR-side names unmangled: `emit_value` mangles variables when
+        // it renders them, so the binding line has to mangle to match.
+        let mut bound: Vec<(String, Option<Expr>, Option<Expr>)> = vec![(
+            plan.primary.clone(),
+            plan.primary_head.clone().map(Expr::Var),
+            plan.primary_tail.clone().map(Expr::Var),
+        )];
+        out.push_str(&format!("{pad}match {switched}:\n"));
+        out.push_str(&format!("{pad}  case SchemeList/Nil:\n"));
+        self.emit_return(then_branch, depth + 2, globals, out);
+        out.push_str(&format!("{pad}  case SchemeList/Cons:\n"));
+        if let Some(h) = &plan.primary_head {
+            out.push_str(&format!("{0}    {1} = {switched}.head\n", pad, mangle(h)));
+        }
+        if let Some(t) = &plan.primary_tail {
+            out.push_str(&format!("{0}    {1} = {switched}.tail\n", pad, mangle(t)));
+        }
+
+        match &plan.secondary {
+            None => {
+                let body = substitute_accessors(else_branch, &bound);
+                self.emit_return(&body, depth + 2, globals, out);
+            }
+            Some((name, head, tail)) => {
+                out.push_str(&format!("{0}    match {1}:\n", pad, mangle(name)));
+                // An exhausted second list falls back to the accessor
+                // sentinels, which is exactly what scheme_car/scheme_cdr give.
+                out.push_str(&format!("{0}      case SchemeList/Nil:\n", pad));
+                let mut nil_bound = bound.clone();
+                nil_bound.push((name.clone(), Some(Expr::Number(0)), Some(Expr::Nil)));
+                let nil_body = substitute_accessors(else_branch, &nil_bound);
+                self.emit_return(&nil_body, depth + 4, globals, out);
+                out.push_str(&format!("{0}      case SchemeList/Cons:\n", pad));
+                if let Some(h) = head {
+                    out.push_str(&format!(
+                        "{0}        {1} = {2}.head\n",
+                        pad,
+                        mangle(h),
+                        mangle(name)
+                    ));
+                }
+                if let Some(t) = tail {
+                    out.push_str(&format!(
+                        "{0}        {1} = {2}.tail\n",
+                        pad,
+                        mangle(t),
+                        mangle(name)
+                    ));
+                }
+                bound.push((
+                    name.clone(),
+                    head.clone().map(Expr::Var),
+                    tail.clone().map(Expr::Var),
+                ));
+                let body = substitute_accessors(else_branch, &bound);
+                self.emit_return(&body, depth + 4, globals, out);
+            }
+        }
+    }
+
     fn emit_value(
         &mut self,
         expr: &Expr,
@@ -182,6 +272,269 @@ impl Emitter {
         }
     }
 }
+/// Recognises `(null? x)` where `x` is a plain variable.
+fn null_test_variable(condition: &Expr) -> Option<&str> {
+    match condition {
+        Expr::Null(inner) => match &**inner {
+            Expr::Var(name) => Some(name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// The list variables one `match` binds.
+struct Destructure {
+    /// The variable named by the test; its `Nil` arm is the original `then`.
+    primary: String,
+    primary_head: Option<String>,
+    primary_tail: Option<String>,
+    /// A second list walked in lockstep, when one qualifies.
+    secondary: Option<(String, Option<String>, Option<String>)>,
+}
+
+/// Plans a destructuring `match`, or declines.
+///
+/// A variable qualifies only when it is used *solely* as `(car x)` / `(cdr x)`
+/// in the cons branch and not at all in the nil branch: any other use would
+/// itself need a copy, which is the cost this rewrite exists to remove.
+fn plan_destructure(tested: &str, then_branch: &Expr, else_branch: &Expr) -> Option<Destructure> {
+    let targets = |name: &str| -> Option<(Option<String>, Option<String>)> {
+        if uses_variable(then_branch, name) {
+            return None;
+        }
+        let mut head = false;
+        let mut tail = false;
+        if !scan_accessors(else_branch, name, &mut head, &mut tail) || (!head && !tail) {
+            return None;
+        }
+        Some((
+            head.then(|| format!("{name}_head")),
+            tail.then(|| format!("{name}_tail")),
+        ))
+    };
+
+    let (primary_head, primary_tail) = targets(tested)?;
+
+    // A variable bound by a `let` *inside* a branch is not in scope at the
+    // `if`, so binding it with a hoisted match would reference it before it
+    // exists. (Such a variable can still be bound by a match at a nested `if`
+    // that sits within its own scope.)
+    let mut inner_locals = Vec::new();
+    collect_let_bound(then_branch, &mut inner_locals);
+    collect_let_bound(else_branch, &mut inner_locals);
+
+    let mut candidates = Vec::new();
+    collect_accessor_vars(else_branch, &mut candidates);
+    let secondary = candidates
+        .into_iter()
+        .filter(|name| name != tested && !inner_locals.contains(name))
+        .filter_map(|name| targets(&name).map(|(h, t)| (name, h, t)))
+        .max_by_key(|(_, h, t)| h.is_some() as usize + t.is_some() as usize);
+
+    Some(Destructure {
+        primary: tested.to_owned(),
+        primary_head,
+        primary_tail,
+        secondary,
+    })
+}
+
+/// Every variable bound by a `let` anywhere inside `expr`.
+fn collect_let_bound(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Let { bindings, body } => {
+            for (name, value) in bindings {
+                out.push(name.clone());
+                collect_let_bound(value, out);
+            }
+            collect_let_bound(body, out);
+        }
+        Expr::Primitive { args, .. } | Expr::Call { args, .. } => {
+            for arg in args {
+                collect_let_bound(arg, out);
+            }
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_let_bound(condition, out);
+            collect_let_bound(then_branch, out);
+            collect_let_bound(else_branch, out);
+        }
+        Expr::Cons(a, b) => {
+            collect_let_bound(a, out);
+            collect_let_bound(b, out);
+        }
+        Expr::Car(v) | Expr::Cdr(v) | Expr::Null(v) => collect_let_bound(v, out),
+        Expr::Var(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Nil => {}
+    }
+}
+
+/// Every variable appearing as `(car x)` or `(cdr x)`.
+fn collect_accessor_vars(expr: &Expr, out: &mut Vec<String>) {
+    match expr {
+        Expr::Car(inner) | Expr::Cdr(inner) => {
+            if let Expr::Var(name) = &**inner {
+                if !out.iter().any(|n| n == name) {
+                    out.push(name.clone());
+                }
+            }
+            collect_accessor_vars(inner, out);
+        }
+        Expr::Primitive { args, .. } | Expr::Call { args, .. } => {
+            for arg in args {
+                collect_accessor_vars(arg, out);
+            }
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_accessor_vars(condition, out);
+            collect_accessor_vars(then_branch, out);
+            collect_accessor_vars(else_branch, out);
+        }
+        Expr::Let { bindings, body } => {
+            for (_, value) in bindings {
+                collect_accessor_vars(value, out);
+            }
+            collect_accessor_vars(body, out);
+        }
+        Expr::Cons(a, b) => {
+            collect_accessor_vars(a, out);
+            collect_accessor_vars(b, out);
+        }
+        Expr::Null(v) => collect_accessor_vars(v, out),
+        Expr::Var(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Nil => {}
+    }
+}
+
+/// True when `name` occurs anywhere in `expr`.
+fn uses_variable(expr: &Expr, name: &str) -> bool {
+    match expr {
+        Expr::Var(v) => v == name,
+        Expr::Primitive { args, .. } | Expr::Call { args, .. } => {
+            args.iter().any(|a| uses_variable(a, name))
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            uses_variable(condition, name)
+                || uses_variable(then_branch, name)
+                || uses_variable(else_branch, name)
+        }
+        Expr::Let { bindings, body } => {
+            bindings.iter().any(|(_, v)| uses_variable(v, name)) || uses_variable(body, name)
+        }
+        Expr::Cons(a, b) => uses_variable(a, name) || uses_variable(b, name),
+        Expr::Car(v) | Expr::Cdr(v) | Expr::Null(v) => uses_variable(v, name),
+        Expr::Number(_) | Expr::Bool(_) | Expr::Nil => false,
+    }
+}
+
+/// Records which accessors are applied to `name`, and rejects any other use.
+/// Returns false when the variable is used in a way this rewrite cannot handle.
+fn scan_accessors(expr: &Expr, name: &str, head: &mut bool, tail: &mut bool) -> bool {
+    match expr {
+        Expr::Var(v) if v == name => false,
+        Expr::Car(inner) if matches!(&**inner, Expr::Var(v) if v == name) => {
+            *head = true;
+            true
+        }
+        Expr::Cdr(inner) if matches!(&**inner, Expr::Var(v) if v == name) => {
+            *tail = true;
+            true
+        }
+        Expr::Primitive { args, .. } | Expr::Call { args, .. } => {
+            args.iter().all(|a| scan_accessors(a, name, head, tail))
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            scan_accessors(condition, name, head, tail)
+                && scan_accessors(then_branch, name, head, tail)
+                && scan_accessors(else_branch, name, head, tail)
+        }
+        Expr::Let { bindings, body } => {
+            bindings
+                .iter()
+                .all(|(_, v)| scan_accessors(v, name, head, tail))
+                && scan_accessors(body, name, head, tail)
+        }
+        Expr::Cons(a, b) => {
+            scan_accessors(a, name, head, tail) && scan_accessors(b, name, head, tail)
+        }
+        Expr::Car(v) | Expr::Cdr(v) | Expr::Null(v) => scan_accessors(v, name, head, tail),
+        Expr::Var(_) | Expr::Number(_) | Expr::Bool(_) | Expr::Nil => true,
+    }
+}
+
+/// Replaces `(car x)` / `(cdr x)` with the substitute planned for that variable.
+fn substitute_accessors(expr: &Expr, map: &[(String, Option<Expr>, Option<Expr>)]) -> Expr {
+    let lookup = |name: &str, head: bool| -> Option<Expr> {
+        map.iter()
+            .find(|(n, _, _)| n == name)
+            .and_then(|(_, h, t)| if head { h.clone() } else { t.clone() })
+    };
+    match expr {
+        Expr::Car(inner) => {
+            if let Expr::Var(v) = &**inner {
+                if let Some(replacement) = lookup(v, true) {
+                    return replacement;
+                }
+            }
+        }
+        Expr::Cdr(inner) => {
+            if let Expr::Var(v) = &**inner {
+                if let Some(replacement) = lookup(v, false) {
+                    return replacement;
+                }
+            }
+        }
+        _ => {}
+    }
+    map_children(expr, &|child| substitute_accessors(child, map))
+}
+
+fn map_children(expr: &Expr, f: &dyn Fn(&Expr) -> Expr) -> Expr {
+    match expr {
+        Expr::Primitive { op, args } => Expr::Primitive {
+            op: *op,
+            args: args.iter().map(f).collect(),
+        },
+        Expr::Call { callee, args } => Expr::Call {
+            callee: callee.clone(),
+            args: args.iter().map(f).collect(),
+        },
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => Expr::If {
+            condition: Box::new(f(condition)),
+            then_branch: Box::new(f(then_branch)),
+            else_branch: Box::new(f(else_branch)),
+        },
+        Expr::Let { bindings, body } => Expr::Let {
+            bindings: bindings.iter().map(|(n, v)| (n.clone(), f(v))).collect(),
+            body: Box::new(f(body)),
+        },
+        Expr::Cons(a, b) => Expr::Cons(Box::new(f(a)), Box::new(f(b))),
+        Expr::Car(v) => Expr::Car(Box::new(f(v))),
+        Expr::Cdr(v) => Expr::Cdr(Box::new(f(v))),
+        Expr::Null(v) => Expr::Null(Box::new(f(v))),
+        leaf => leaf.clone(),
+    }
+}
+
 fn signed_literal(n: i64) -> String {
     if n >= 0 {
         format!("+{n}")
