@@ -52,7 +52,29 @@ fn unrolls_a_closed_scalar_tail_recurrence() {
     // One recursive call remains after four source iterations are fused into
     // the same ordinary Bend function body, plus the initial call from main.
     assert_eq!(output.matches("return s_sum(").count(), 2);
-    assert!(output.matches("if (s_scheme").count() >= 4);
+    // Countdown tests lower to native `switch`, so each fused iteration shows
+    // up as one switch arm rather than a comparison plus a branch.
+    assert!(output.matches("switch ").count() >= 4);
+    assert!(!output.contains("== "));
+}
+
+#[test]
+fn lowers_a_zero_test_to_a_native_switch() {
+    let output = compile("(define (count n) (if (= n 0) 0 (count (- n 1))))\n(count 3)").unwrap();
+    assert!(output.contains("switch s_schemeLocal0_95_n:"));
+    assert!(output.contains("case 0:"));
+    assert!(output.contains("case _:"));
+    // The `_` arm receives a predecessor binding for the switched variable,
+    // so the decrement costs nothing.
+    assert!(output.contains("s_schemeLocal0_95_n-1"));
+}
+
+#[test]
+fn keeps_ordinary_conditionals_as_if() {
+    // Only `(= x 0)` is switchable; other tests keep the comparison.
+    let output = compile("(define (f n) (if (< n 2) n 0))\n(f 5)").unwrap();
+    assert!(output.contains("if "));
+    assert!(!output.contains("switch "));
 }
 
 #[test]

@@ -22,7 +22,10 @@ Bend toolchain. Example programs live in `examples/`.
 The default compiler pipeline performs Bend-only source optimization before
 rendering: it inlines small direct helpers, shares repeated total numeric
 expressions, and unrolls eligible closed scalar tail recurrences four times.
-Those are ordinary Bend constructs, not an HVM fork or an FFI escape hatch.
+Codegen additionally lowers `(= x 0)` tests in tail position to Bend's native
+numeric `switch`, which drops the compare interaction and hands the `_` arm a
+free predecessor binding for `x`. Those are ordinary Bend constructs, not an
+HVM fork or an FFI escape hatch.
 Use `--no-opt` for direct lowering, `--no-cse` to evaluate recomputation rather
 than sharing, or `--tail-unroll 1` to keep inlining/CSE while disabling
 recurrence specialization.
@@ -105,8 +108,14 @@ script locally before drawing small timing conclusions.
 
 Two effects dominate. First, Bend parallelizes well (about 6-7x on 8 threads),
 but HVM's per-operation constant is large: every primitive is a tagged
-interaction and every Scheme call is a full net rewrite. Second, HVM has no
-native scalar loop corresponding to SBCL's jump. Chunky workloads do not
+interaction. (Function calls are *not* the cost: Bend inlines non-recursive
+definitions, so a helper called from one or two sites contributes no call
+rewrites at all. Measured directly: a loop calling a trivial helper and the
+same loop with the body written out produce identical interaction counts.)
+Second, HVM has no native scalar loop corresponding to SBCL's jump, and
+control flow is the expensive primitive -- a comparison plus branch costs
+roughly twice an arithmetic operation, while a bare loop skeleton costs about
+13 interactions per iteration even with no arithmetic in it. Chunky workloads do not
 automatically win, because the "chunk" is itself made of interactions. What
 helps measurably is reducing the number of those interactions in emitted Bend:
 
@@ -115,6 +124,10 @@ helps measurably is reducing the number of those interactions in emitted Bend:
   `benchmarks/mandelbrot.scm` exercise this path.
 - Specializing a closed scalar recurrence into four ordinary Bend iterations
   removes three of every four recursive call expansions.
+- Lowering a zero test to native `switch` removes both the compare and, via the
+  predecessor binding, the decrement. A 20,000-iteration accumulator loop in
+  Scheme drops from 310,013 to 170,007 interactions (about 45%) with an
+  unchanged result.
 
 These are local source-level fixes; ordinary Bend still evaluates each dynamic
 arithmetic primitive as an interaction.

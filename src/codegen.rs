@@ -90,11 +90,15 @@ impl Emitter {
                 then_branch,
                 else_branch,
             } => {
-                let condition = self.emit_value(condition, depth, globals, out);
-                out.push_str(&format!("{pad}if {condition}:\n"));
-                self.emit_return(then_branch, depth + 1, globals, out);
-                out.push_str(&format!("{pad}else:\n"));
-                self.emit_return(else_branch, depth + 1, globals, out);
+                if let Some(name) = zero_test_variable(condition) {
+                    self.emit_zero_switch(name, then_branch, else_branch, depth, globals, out);
+                } else {
+                    let condition = self.emit_value(condition, depth, globals, out);
+                    out.push_str(&format!("{pad}if {condition}:\n"));
+                    self.emit_return(then_branch, depth + 1, globals, out);
+                    out.push_str(&format!("{pad}else:\n"));
+                    self.emit_return(else_branch, depth + 1, globals, out);
+                }
             }
             _ => {
                 let value = self.emit_value(expr, depth, globals, out);
@@ -102,6 +106,41 @@ impl Emitter {
             }
         }
     }
+    /// Lower `(if (= x 0) then else)` to a native numeric `switch`.
+    ///
+    /// Bend's `switch` matches `0` against the first arm and sends everything
+    /// else -- including negative I24 values -- to `_`, which is exactly the
+    /// comparison's semantics, so this is safe for every input. It saves the
+    /// compare interaction, and the `_` arm additionally exposes a free
+    /// predecessor binding for the switched variable, which retires the
+    /// `(- x 1)` that countdown loops otherwise pay for each iteration.
+    fn emit_zero_switch(
+        &mut self,
+        name: &str,
+        then_branch: &Expr,
+        else_branch: &Expr,
+        depth: usize,
+        globals: &BTreeSet<String>,
+        out: &mut String,
+    ) {
+        let pad = "  ".repeat(depth);
+        let switched = mangle(name);
+        let predecessor = self.temp();
+        let (else_body, uses_predecessor) = use_predecessor(else_branch, name, &predecessor);
+        out.push_str(&format!("{pad}switch {switched}:\n"));
+        out.push_str(&format!("{pad}  case 0:\n"));
+        self.emit_return(then_branch, depth + 2, globals, out);
+        out.push_str(&format!("{pad}  case _:\n"));
+        if uses_predecessor {
+            out.push_str(&format!(
+                "{0}    {1} = {switched}-1\n",
+                pad,
+                mangle(&predecessor)
+            ));
+        }
+        self.emit_return(&else_body, depth + 2, globals, out);
+    }
+
     fn emit_value(
         &mut self,
         expr: &Expr,
@@ -182,6 +221,121 @@ impl Emitter {
         }
     }
 }
+/// Recognizes `(= x 0)` / `(= 0 x)` and returns the compared variable.
+fn zero_test_variable(condition: &Expr) -> Option<&str> {
+    let Expr::Primitive { op, args } = condition else {
+        return None;
+    };
+    if !matches!(op, Primitive::Eq) {
+        return None;
+    }
+    let [left, right] = args.as_slice() else {
+        return None;
+    };
+    let is_zero = |expr: &Expr| matches!(expr, Expr::Number(0) | Expr::Bool(false));
+    match (left, right) {
+        (Expr::Var(name), other) if is_zero(other) => Some(name),
+        (other, Expr::Var(name)) if is_zero(other) => Some(name),
+        _ => None,
+    }
+}
+
+/// Replaces `(- name 1)` with `predecessor`, reporting whether it matched.
+fn use_predecessor(expr: &Expr, name: &str, predecessor: &str) -> (Expr, bool) {
+    let replaced = |args: &Vec<Expr>| {
+        matches!(
+            args.as_slice(),
+            [Expr::Var(argument), Expr::Number(1)] if argument == name
+        )
+    };
+    match expr {
+        Expr::Primitive { op, args } if matches!(op, Primitive::Sub) && replaced(args) => {
+            (Expr::Var(predecessor.to_owned()), true)
+        }
+        Expr::Primitive { op, args } => {
+            let (args, used) = use_predecessor_all(args, name, predecessor);
+            (Expr::Primitive { op: *op, args }, used)
+        }
+        Expr::Call { callee, args } => {
+            let (args, used) = use_predecessor_all(args, name, predecessor);
+            (
+                Expr::Call {
+                    callee: callee.clone(),
+                    args,
+                },
+                used,
+            )
+        }
+        Expr::If {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let (condition, a) = use_predecessor(condition, name, predecessor);
+            let (then_branch, b) = use_predecessor(then_branch, name, predecessor);
+            let (else_branch, c) = use_predecessor(else_branch, name, predecessor);
+            (
+                Expr::If {
+                    condition: Box::new(condition),
+                    then_branch: Box::new(then_branch),
+                    else_branch: Box::new(else_branch),
+                },
+                a || b || c,
+            )
+        }
+        Expr::Let { bindings, body } => {
+            let mut used = false;
+            let bindings = bindings
+                .iter()
+                .map(|(binding, value)| {
+                    let (value, hit) = use_predecessor(value, name, predecessor);
+                    used |= hit;
+                    (binding.clone(), value)
+                })
+                .collect();
+            let (body, hit) = use_predecessor(body, name, predecessor);
+            (
+                Expr::Let {
+                    bindings,
+                    body: Box::new(body),
+                },
+                used || hit,
+            )
+        }
+        Expr::Cons(head, tail) => {
+            let (head, a) = use_predecessor(head, name, predecessor);
+            let (tail, b) = use_predecessor(tail, name, predecessor);
+            (Expr::Cons(Box::new(head), Box::new(tail)), a || b)
+        }
+        Expr::Car(value) => {
+            let (value, used) = use_predecessor(value, name, predecessor);
+            (Expr::Car(Box::new(value)), used)
+        }
+        Expr::Cdr(value) => {
+            let (value, used) = use_predecessor(value, name, predecessor);
+            (Expr::Cdr(Box::new(value)), used)
+        }
+        Expr::Null(value) => {
+            let (value, used) = use_predecessor(value, name, predecessor);
+            (Expr::Null(Box::new(value)), used)
+        }
+        leaf => (leaf.clone(), false),
+    }
+}
+
+fn use_predecessor_all(args: &[Expr], name: &str, predecessor: &str) -> (Vec<Expr>, bool) {
+    let mut used = false;
+    let args = args
+        .iter()
+        .map(|arg| {
+            let (arg, hit) = use_predecessor(arg, name, predecessor);
+            used |= hit;
+            arg
+        })
+        .collect();
+    (args, used)
+}
+
 fn signed_literal(n: i64) -> String {
     if n >= 0 {
         format!("+{n}")
