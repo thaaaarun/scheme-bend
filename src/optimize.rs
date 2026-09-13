@@ -5,6 +5,7 @@
 //! nodes that the Bend compiler needs to lower.
 
 use crate::ir::{Definition, Expr, Primitive, Program};
+use crate::shape::Shape;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Tuning knobs for the whole-program optimizer.
@@ -29,6 +30,10 @@ pub struct Options {
     /// over them can fold. Without this, an inlined constant argument stays a
     /// variable read and both branches survive into the emitted Bend.
     pub constant_propagation: bool,
+    /// Which shape to emit for a recognized associative reduction. Shape is
+    /// the lever over parallelism, since HVM finds parallelism in the net
+    /// rather than from annotations; `benchmarks/shape_search.py` picks it.
+    pub shape: Shape,
 }
 
 impl Default for Options {
@@ -38,11 +43,15 @@ impl Default for Options {
             common_subexpressions: true,
             tail_unroll: 8,
             constant_propagation: true,
+            shape: Shape::AsWritten,
         }
     }
 }
 
-pub fn optimize(mut program: Program, options: Options) -> Program {
+pub fn optimize(program: Program, options: Options) -> Program {
+    // Shape first: it can introduce a new definition for the other passes to
+    // work on, and every later pass preserves the shape it chooses.
+    let mut program = crate::shape::apply(program, options.shape);
     let mut fresh = Fresh::from_program(&program);
 
     if options.inline_helpers {

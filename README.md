@@ -47,6 +47,56 @@ and later signed comparisons are wrong. Measured directly against bend-lang
 returns `-8`. The emitter therefore stays on `if`, and a regression test pins
 this.
 
+## Shape selection
+
+HVM finds parallelism in the interaction net rather than in annotations, so the
+clearest lever a compiler has over parallelism is the *shape* of the code it
+emits. The default emitter preserves the shape you wrote; `--shape` re-associates
+a recognized reduction into a different one.
+
+```sh
+scheme-bend --shape asis       prog.scm   # as written (default)
+scheme-bend --shape balanced   prog.scm   # re-associate the whole range
+scheme-bend --shape chunked:8  prog.scm   # 8 chain segments, balanced combine
+```
+
+The recognized form is an ascending counted reduction whose combiner is `+` or `*`:
+
+```scheme
+(define (f i n acc)
+  (if (> i n) acc (f (+ i 1) n (OP acc G))))
+```
+
+Re-association is legal because the target's arithmetic wraps modulo 2^24, which
+is a ring: `+` and `*` are associative and commutative there, while `-` and
+truncating `/` are not and are never rewritten. The pass fires only when the
+top-level call has literal, non-negative bounds, so every synthesized midpoint
+stays in range and the generated recursion is well founded.
+
+`benchmarks/shape_search.py` sweeps the shapes, refuses to rank a program whose
+shapes disagree on the answer, and reports the winner per thread count. For the
+sum of 1..2,000,000 -- every shape returns `+5857856` -- median of 3:
+
+| shape | ITRS | 1 thread | 2 threads | 4 threads | 8 threads |
+|---|---:|---:|---:|---:|---:|
+| asis | 40,000,019 | 0.399s | 0.564s | 0.517s | 0.491s |
+| balanced | 167,999,952 | 1.344s | 1.376s | 1.361s | 0.288s |
+| chunked:2 | 40,000,042 | 0.385s | 0.203s | 0.266s | 0.260s |
+| chunked:4 | 40,000,084 | 0.391s | 0.201s | 0.197s | 0.218s |
+| chunked:8 | 40,000,168 | 0.393s | 0.204s | 0.163s | 0.199s |
+
+Three things this shows. `chunked` holds the interaction count flat while buying
+2-2.4x at two or more threads, so it is close to free. `balanced` pays 4.2x the
+interactions and is *worse* than asis until the last thread, because its extra
+serial work is only repaid once there is real slack to fill. And the winner
+depends on how many threads are available, so there is no single best shape.
+
+Note also that ITRS cannot rank these: `chunked:8` reports roughly the same
+count as `asis` and runs 2.5x faster, and `asis` gets *slower* when given a
+second thread (0.399s to 0.564s) with its interaction count unchanged. Use ITRS
+to compare compiler transformations on one thread and to catch regressions; rank
+parallel shapes with wall clock.
+
 ## Supported subset
 
 Signed 24-bit integers (`-8,388,608..=8,388,607`), `#t`/`#f` (lowered to Bend's `1`/`0` conditions), top-level `define` (including shorthand

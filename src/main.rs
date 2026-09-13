@@ -1,4 +1,5 @@
 use scheme_bend::optimize::Options;
+use scheme_bend::shape::Shape;
 use std::{env, fs, process::ExitCode};
 
 fn main() -> ExitCode {
@@ -13,6 +14,8 @@ fn main() -> ExitCode {
                     common_subexpressions: false,
                     tail_unroll: 1,
                     constant_propagation: false,
+                    // Shape is an independent axis; --no-opt leaves it alone.
+                    shape: options.shape,
                 };
             }
             "--tail-unroll" => {
@@ -25,6 +28,21 @@ fn main() -> ExitCode {
                         eprintln!("scheme-bend: --tail-unroll expects an integer from 1 to 8");
                         return ExitCode::from(2);
                     }
+                }
+            }
+            "--shape" => {
+                let Some(value) = args.next() else {
+                    return usage();
+                };
+                match parse_shape(&value) {
+                    Ok(shape) => options.shape = shape,
+                    Err(()) => return usage(),
+                }
+            }
+            _ if argument.starts_with("--shape=") => {
+                match parse_shape(&argument["--shape=".len()..]) {
+                    Ok(shape) => options.shape = shape,
+                    Err(()) => return usage(),
                 }
             }
             "--no-cse" => options.common_subexpressions = false,
@@ -62,9 +80,16 @@ fn main() -> ExitCode {
     }
 }
 
+fn parse_shape(value: &str) -> Result<Shape, ()> {
+    Shape::parse(value).ok_or_else(|| {
+        eprintln!("scheme-bend: --shape expects asis, balanced, or chunked:N");
+    })
+}
+
 fn usage() -> ExitCode {
     eprintln!(
-        "usage: scheme-bend [--no-opt] [--no-cse] [--no-const-prop] [--tail-unroll 1..8] <input.scm>"
+        "usage: scheme-bend [--no-opt] [--no-cse] [--no-const-prop] [--tail-unroll 1..8] \
+         [--shape asis|balanced|chunked:N] <input.scm>"
     );
     ExitCode::from(2)
 }

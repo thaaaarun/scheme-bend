@@ -5,6 +5,7 @@ pub mod codegen;
 pub mod ir;
 pub mod optimize;
 pub mod sexpr;
+pub mod shape;
 
 use std::fmt;
 
