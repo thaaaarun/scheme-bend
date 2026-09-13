@@ -31,11 +31,11 @@ fn desugars_immediate_lambda_and_emits_let() {
     )
     .unwrap();
     assert!(
-        output.contains("s_schemeLocal1_95_x = s_rec(+3)"),
+        output.contains("s_schemeLocal1Q95_x = s_rec(+3)"),
         "{output}"
     );
     assert!(
-        output.contains("return (s_schemeLocal1_95_x + s_schemeLocal1_95_x)"),
+        output.contains("return (s_schemeLocal1Q95_x + s_schemeLocal1Q95_x)"),
         "{output}"
     );
 }

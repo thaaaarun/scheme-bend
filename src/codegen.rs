@@ -686,16 +686,33 @@ fn render_primitive(op: Primitive, args: &[String]) -> String {
     };
     format!("({} {symbol} {})", args[0], args[1])
 }
+/// Render a Scheme identifier as a Bend identifier.
+///
+/// Alphanumerics pass through; every other character is escaped as `Q<code>_`,
+/// where `<code>` is its decimal code point. The escape marker `Q` is itself
+/// escaped, so every `Q` in the output begins an escape.
+///
+/// The marker cannot be `_`. Bend rejects any top-level name containing `__`,
+/// and an escape that begins or ends with `_` creates one in two ways: two
+/// adjacent escapes (`a__b`), and the `s_` prefix followed by an escape (any
+/// name starting with punctuation, such as `_a`). A leading alphanumeric marker
+/// avoids both, and a trailing `_` terminates the variable-width code so a
+/// code's digits cannot merge into a following digit.
+///
+/// Since a literal `Q` is escaped too, the code is uniquely decodable, so two
+/// distinct Scheme names can never mangle to the same Bend name.
 pub fn mangle(name: &str) -> String {
     let mut result = String::from("s_");
     for ch in name.chars() {
-        if ch.is_ascii_alphanumeric() {
+        if ch.is_ascii_alphanumeric() && ch != 'Q' {
             result.push(ch);
         } else {
-            result.push_str(&format!("_{}_,", ch as u32));
+            result.push('Q');
+            result.push_str(&(ch as u32).to_string());
+            result.push('_');
         }
     }
-    result.replace(',', "")
+    result
 }
 
 #[cfg(test)]
@@ -703,7 +720,26 @@ mod tests {
     use super::*;
     #[test]
     fn mangles_scheme_punctuation() {
-        assert_eq!(mangle("tree-sum?"), "s_tree_45_sum_63_");
+        assert_eq!(mangle("tree-sum?"), "s_treeQ45_sumQ63_");
+    }
+    #[test]
+    fn never_emits_the_double_underscore_bend_forbids() {
+        // Bend rejects `__` in a top-level name. Escapes used to start and end
+        // with `_`, so adjacent escapes, and the `s_` prefix followed by an
+        // escape, both produced one.
+        for name in ["a__b", "__", "_", "a_", "_a", "..", "a-b_c?", "??", "___"] {
+            let mangled = mangle(name);
+            assert!(!mangled.contains("__"), "{name} -> {mangled}");
+        }
+    }
+    #[test]
+    fn escapes_stay_distinguishable() {
+        // A code's digits must not merge into a following digit: `_` is 95 and
+        // tab is 9, so without a terminator these two could collide.
+        assert_ne!(mangle("_b"), mangle("\u{9}b"));
+        assert_ne!(mangle("a_b"), mangle("a95b"));
+        // The marker itself must be escaped, or `Q` and `Q45` would collide.
+        assert_ne!(mangle("Q"), mangle("Q45"));
     }
     #[test]
     fn emits_signed_i24_literals() {

@@ -383,9 +383,10 @@ fn chunked_tree(name: &str, reduction: &Reduction, lo: i64, hi: i64, k: u32) -> 
 
 /// The generated helper's name.
 ///
-/// It must contain no underscore: `codegen::mangle` renders `_` as `_95_`, and
-/// Bend rejects any top-level name containing `__`, so two underscores in the
-/// source name would produce an unloadable program.
+/// Suffixed rather than prefixed so a reduction's own name stays the head of
+/// it, which keeps the emitted Bend readable next to the function it came from.
+/// Any name would do: `mangle` is injective and no longer emits the `__` that
+/// Bend forbids, but an escaped `_` still costs five characters.
 fn helper_name(name: &str) -> String {
     format!("{name}ShapeBalanced")
 }
