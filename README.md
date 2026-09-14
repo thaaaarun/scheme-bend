@@ -6,6 +6,7 @@ and CPU/CUDA work.
 
 ```
 Scheme source -> S-expression parser -> Scheme AST/desugaring -> functional IR -> Bend source
+                                           \-> static graph IR -> scheduled Bend
 ```
 
 ## Build and run
@@ -97,13 +98,84 @@ second thread (0.399s to 0.564s) with its interaction count unchanged. Use ITRS
 to compare compiler transformations on one thread and to catch regressions; rank
 parallel shapes with wall clock.
 
+## Static graph IR
+
+The compiler also accepts a static weighted DAG declaration. Its node values are
+weighted sums of predecessor values; inputs become function arguments and
+outputs become a `SchemeList` result:
+
+```scheme
+(define-graph layer
+  (nodes 6)
+  (inputs (0 1))
+  (outputs (4 5))
+  (edges
+    (0 2 2) (1 2 1)
+    (2 4 3) (1 5 -1)))
+```
+
+The graph pass runs before ordinary Bend emission. It removes every node that
+cannot reach an output, rejects cycles on live paths, topologically schedules
+the survivors, and emits only explicit weighted edges. Fan-in is rendered as a
+balanced sum tree, while output construction is fused into the generated graph
+function; there is no dense matrix or runtime adjacency lookup. This is the
+high-leverage path for pruned, statically structured networks. General-purpose
+Map manipulation and richer dynamic graph policies remain separate follow-up
+features.
+
+## Dynamic sparse frontier
+
+The compiler now has a specialized runtime frontier primitive:
+
+```scheme
+(sparse-frontier adjacency frontier state)
+```
+
+`adjacency` is a Bend `Map` from node ids to edge lists. Each frontier event is
+`(node activation)`, represented using ordinary `cons` pairs, and `state` is a
+`Map` of accumulated node values. The emitted kernel checks for zero
+activations before looking up or expanding outgoing edges, uses `Map/get_check`
+for missing rows, and accumulates contributions with persistent `Map/set`.
+
+This is an event-driven dynamic graph path: it can prune runtime-zero work, but
+it cannot remove structure before execution the way `define-graph` can. The
+current primitive assumes an acyclic or otherwise terminating frontier; future
+work should add cycle/visited-state policies and parallel local-map merging.
+
+For the common two-hop matmul case there is also a narrower kernel:
+
+```scheme
+(sparse-scatter adjacency frontier state)
+(sparse-square-sum state column-count)
+(sparse-chunk-tree rows row-count chunk-size)
+(sparse-parallel-chunks chunk-tree adjacency size)
+```
+
+`sparse-scatter` expands each `(source, activation)` event directly into the
+destination accumulator Map. It does not enqueue destination events, making it
+the preferred dynamic adapter when the graph is a single sparse matrix product.
+`sparse-square-sum` is the matching benchmark reduction and consumes Map
+lookups in one threaded scan. `sparse-chunk-tree` builds a balanced tree of
+contiguous row chunks; `sparse-parallel-chunks` applies the existing efficient
+scatter independently to each chunk and combines chunk results as a binary
+reduction tree. Chunking avoids duplicating the full adjacency Map once per
+row while still exposing parallel work.
+
 ## Supported subset
 
 Signed 24-bit integers (`-8,388,608..=8,388,607`), `#t`/`#f` (lowered to Bend's `1`/`0` conditions), top-level `define` (including shorthand
-function definitions), `lambda`, `if`, parallel `let`, named function calls,
-top-level recursion, binary `+ - * / = < > <= >=`, and immutable pairs/lists
+function definitions), static `define-graph` DAGs, `map-empty`, `map-get`, `map-set`, `sparse-frontier`, `sparse-scatter`, `sparse-square-sum`, `sparse-chunk-tree`, `sparse-parallel-chunks`, `lambda`, `if`, parallel `let`, named function calls,
+top-level recursion, binary `+ - * / mul0 = < > <= >=`, and immutable pairs/lists
 via `cons`, `car`, `cdr`, `null?`, and `()` are supported. A final top-level
 expression becomes Bend `main`.
+
+`mul0` is an explicit sparse-kernel primitive. It returns zero immediately when
+either operand is zero, exposing the annihilating branch before the other operand
+is demanded; ordinary `*` retains the normal arithmetic lowering. This is useful
+when operands represent graph work whose subgraph should disappear, but it does
+not by itself remove dense list traversal. The current implementation is an
+experimental compiler hook: HVM's strict evaluation still needs a further lazy
+combinator step before arbitrary recursive RHS work is guaranteed to disappear.
 
 Anonymous lambdas can be invoked immediately, which desugars to a `let`.
 Top-level functions can be recursive. First-class closures, passing functions
@@ -135,6 +207,21 @@ has no supported CUDA path.
 
 The Mandelbrot program uses signed I24 arithmetic throughout and has matching
 Scheme/Bend and SBCL output: checksum `3808042`.
+
+`benchmarks/matmul-sparse.scm` is the first sparse graph kernel. It stores each
+matrix row as sorted `(column, weight)` edges, omits zero entries, expands each
+`A[i,k]` edge through the corresponding sparse row of `B`, and aggregates by
+output column before squaring. Output rows are independent, so the outer row
+recursion supplies HVM's parallel frontier. Its cursor join walks B's row list
+monotonically instead of indexing it from the beginning for every edge. The
+current sorted-list accumulator is deliberately simple and is the next sparse
+optimization target.
+
+`benchmarks/compare_static_graph.py` is the apples-to-apples static-graph
+measurement: it generates the same fixed 64x64 layer as a graph with eight
+nonzero edges per output and as a dense list of all 4,096 weights, repeats the
+layer 256 times, and checks that both compiled programs agree before reporting
+ITRS and wall time.
 
 For the same signed-I24 Mandelbrot program, the compiler modes produce these
 deterministic HVM interaction counts:

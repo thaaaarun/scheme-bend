@@ -646,6 +646,20 @@ fn fold_identity(op: Primitive, args: &[Expr]) -> Option<Expr> {
                 return Some(left.clone());
             }
         }
+        Primitive::Mul0 => {
+            // `mul0` deliberately exposes annihilation even when the other
+            // operand is not droppable: its contract is that a zero operand
+            // prevents the other operand from being demanded.
+            if number(left) == Some(0) || number(right) == Some(0) {
+                return Some(Expr::Number(0));
+            }
+            if number(left) == Some(1) {
+                return Some(right.clone());
+            }
+            if number(right) == Some(1) {
+                return Some(left.clone());
+            }
+        }
         Primitive::Add => {
             if number(left) == Some(0) {
                 return Some(right.clone());
@@ -726,6 +740,7 @@ fn fold_primitive(op: Primitive, args: &[Expr]) -> Option<Expr> {
         Primitive::Add => left.checked_add(*right)?,
         Primitive::Sub => left.checked_sub(*right)?,
         Primitive::Mul => left.checked_mul(*right)?,
+        Primitive::Mul0 => left.checked_mul(*right)?,
         Primitive::Div if *right != 0 => left.checked_div(*right)?,
         Primitive::Div => return None,
         Primitive::Eq => return Some(Expr::Bool(left == right)),

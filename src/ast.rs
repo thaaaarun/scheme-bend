@@ -3,8 +3,30 @@ use crate::{CompileError, sexpr::SExpr};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Program {
     pub definitions: Vec<Definition>,
+    pub graphs: Vec<GraphDefinition>,
     /// The optional final top-level expression becomes generated Bend `main`.
     pub body: Option<Expr>,
+}
+
+/// A statically declared weighted graph.
+///
+/// Node values are scalar sums of weighted predecessor values. `inputs` are
+/// supplied as function arguments and `outputs` are returned as a list. The
+/// graph is deliberately structural: zero-weight edges are not represented.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphDefinition {
+    pub name: String,
+    pub nodes: usize,
+    pub inputs: Vec<usize>,
+    pub outputs: Vec<usize>,
+    pub edges: Vec<GraphEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GraphEdge {
+    pub src: usize,
+    pub dst: usize,
+    pub weight: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,9 +81,17 @@ const FORBIDDEN: &[&str] = &[
 
 pub fn parse_program(forms: Vec<SExpr>) -> Result<Program, CompileError> {
     let mut definitions = Vec::new();
+    let mut graphs = Vec::new();
     let mut body = None;
     for form in forms {
-        if is_define(&form) {
+        if is_graph_define(&form) {
+            if body.is_some() {
+                return Err(CompileError(
+                    "a top-level definition cannot follow the program expression".into(),
+                ));
+            }
+            graphs.push(parse_graph_define(form)?);
+        } else if is_define(&form) {
             if body.is_some() {
                 return Err(CompileError(
                     "a top-level define cannot follow the program expression".into(),
@@ -74,11 +104,179 @@ pub fn parse_program(forms: Vec<SExpr>) -> Result<Program, CompileError> {
             ));
         }
     }
-    Ok(Program { definitions, body })
+    Ok(Program {
+        definitions,
+        graphs,
+        body,
+    })
 }
 
 fn is_define(form: &SExpr) -> bool {
     matches!(form, SExpr::List(items) if matches!(items.first(), Some(SExpr::Symbol(s)) if s == "define"))
+}
+
+fn is_graph_define(form: &SExpr) -> bool {
+    matches!(form, SExpr::List(items) if matches!(items.first(), Some(SExpr::Symbol(s)) if s == "define-graph"))
+}
+
+fn parse_graph_define(form: SExpr) -> Result<GraphDefinition, CompileError> {
+    let SExpr::List(items) = form else {
+        unreachable!()
+    };
+    if items.len() != 6 {
+        return Err(CompileError(
+            "define-graph expects a name, nodes, inputs, outputs, and edges".into(),
+        ));
+    }
+    let SExpr::Symbol(name) = &items[1] else {
+        return Err(CompileError("define-graph needs an identifier".into()));
+    };
+    let name = valid_name(name)?;
+    let nodes = parse_graph_count(&items[2], "nodes")?;
+    let inputs = parse_graph_id_list(&items[3], "inputs")?;
+    let outputs = parse_graph_id_list(&items[4], "outputs")?;
+    let edges = parse_graph_edges(&items[5])?;
+
+    ensure_distinct_usize(&inputs, "graph inputs")?;
+    ensure_distinct_usize(&outputs, "graph outputs")?;
+    for &node in inputs.iter().chain(&outputs) {
+        if node >= nodes {
+            return Err(CompileError(format!(
+                "graph node {node} is outside the declared node range 0..{nodes}"
+            )));
+        }
+    }
+    for edge in &edges {
+        if edge.src >= nodes || edge.dst >= nodes {
+            return Err(CompileError(format!(
+                "graph edge ({}, {}) is outside the declared node range 0..{}",
+                edge.src, edge.dst, nodes
+            )));
+        }
+        if edge.weight == 0 {
+            return Err(CompileError(
+                "graph edges must have nonzero weights; omit zero edges".into(),
+            ));
+        }
+    }
+    for (i, edge) in edges.iter().enumerate() {
+        if edges[..i]
+            .iter()
+            .any(|prior| prior.src == edge.src && prior.dst == edge.dst)
+        {
+            return Err(CompileError(format!(
+                "duplicate graph edge ({}, {})",
+                edge.src, edge.dst
+            )));
+        }
+    }
+    Ok(GraphDefinition {
+        name,
+        nodes,
+        inputs,
+        outputs,
+        edges,
+    })
+}
+
+fn parse_graph_count(form: &SExpr, label: &str) -> Result<usize, CompileError> {
+    let SExpr::List(items) = form else {
+        return Err(CompileError(format!(
+            "graph {label} must be written as ({label} n)"
+        )));
+    };
+    if items.len() != 2 || items[0] != SExpr::Symbol(label.into()) {
+        return Err(CompileError(format!(
+            "graph {label} must be written as ({label} n)"
+        )));
+    }
+    graph_usize(&items[1], label)
+}
+
+fn parse_graph_id_list(form: &SExpr, label: &str) -> Result<Vec<usize>, CompileError> {
+    let SExpr::List(items) = form else {
+        return Err(CompileError(format!(
+            "graph {label} must be a list of node ids"
+        )));
+    };
+    if items.len() != 2 || items[0] != SExpr::Symbol(label.into()) {
+        return Err(CompileError(format!(
+            "graph {label} must be written as ({label} (...))"
+        )));
+    }
+    let SExpr::List(ids) = &items[1] else {
+        return Err(CompileError(format!(
+            "graph {label} must be a list of node ids"
+        )));
+    };
+    ids.iter().map(|id| graph_usize(id, label)).collect()
+}
+
+fn parse_graph_edges(form: &SExpr) -> Result<Vec<GraphEdge>, CompileError> {
+    let SExpr::List(items) = form else {
+        return Err(CompileError(
+            "graph edges must be written as (edges (...))".into(),
+        ));
+    };
+    if items.is_empty() || items[0] != SExpr::Symbol("edges".into()) {
+        return Err(CompileError(
+            "graph edges must be written as (edges (...))".into(),
+        ));
+    }
+    let edge_forms = match items.get(1) {
+        Some(SExpr::List(edges))
+            if edges.is_empty() || matches!(edges.first(), Some(SExpr::List(_))) =>
+        {
+            edges.clone()
+        }
+        _ => items[1..].to_vec(),
+    };
+    edge_forms
+        .into_iter()
+        .map(|form| {
+            let SExpr::List(edge) = form else {
+                return Err(CompileError(
+                    "each graph edge must be (source target weight)".into(),
+                ));
+            };
+            if edge.len() != 3 {
+                return Err(CompileError(
+                    "each graph edge must be (source target weight)".into(),
+                ));
+            }
+            Ok(GraphEdge {
+                src: graph_usize(&edge[0], "edge source")?,
+                dst: graph_usize(&edge[1], "edge target")?,
+                weight: graph_number(&edge[2], "edge weight")?,
+            })
+        })
+        .collect()
+}
+
+fn graph_usize(form: &SExpr, label: &str) -> Result<usize, CompileError> {
+    let SExpr::Number(value) = form else {
+        return Err(CompileError(format!(
+            "graph {label} must be a nonnegative integer"
+        )));
+    };
+    usize::try_from(*value)
+        .map_err(|_| CompileError(format!("graph {label} must be a nonnegative integer")))
+}
+
+fn graph_number(form: &SExpr, label: &str) -> Result<i64, CompileError> {
+    let SExpr::Number(value) = form else {
+        return Err(CompileError(format!("graph {label} must be an integer")));
+    };
+    Ok(*value)
+}
+
+fn ensure_distinct_usize(values: &[usize], description: &str) -> Result<(), CompileError> {
+    for (i, value) in values.iter().enumerate() {
+        if values[..i].contains(value) {
+            return Err(CompileError(format!("duplicate {description}: `{value}`")));
+        }
+    }
+    Ok(())
 }
 
 fn parse_define(form: SExpr) -> Result<Definition, CompileError> {

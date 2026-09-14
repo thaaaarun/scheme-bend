@@ -17,7 +17,7 @@ CL_TAKEN = {'t', 'nil', 'count', 'gcd', 'mod', 'sum', 'abs', 'max', 'min',
             'mapcar', 'remove', 'position', 'sort', 'floor', 'truncate',
             'evenp', 'oddp', 'zerop', 'identity'}
 
-ARITH = {'+', '-', '*', '/', '=', '<', '>', '<=', '>='}
+ARITH = {'+', '-', '*', 'mul0', '/', '=', '<', '>', '<=', '>='}
 LIST_TAKERS = {'car', 'cdr', 'null?'}
 
 def parse(src):
@@ -89,8 +89,34 @@ def render(node, ren):
     head = ren.get(head, head) if isinstance(head, str) else head
     if head == '/':
         return f"(truncate {render(node[1], ren)} {render(node[2], ren)})"
+    if head == 'mul0':
+        # Common Lisp's arithmetic is strict, but benchmark operands are total
+        # and this preserves the numeric result for the reference run.
+        return f"(* {render(node[1], ren)} {render(node[2], ren)})"
     if head == 'null?':
         return f"(null {render(node[1], ren)})"
+    if head == 'map-empty':
+        return "(make-hash-table :test #'eql)"
+    if head == 'map-get':
+        return f"(gethash {render(node[2], ren)} {render(node[1], ren)} {render(node[3], ren)})"
+    if head == 'map-set':
+        return f"(sb-map-set {render(node[1], ren)} {render(node[2], ren)} {render(node[3], ren)})"
+    if head == 'sparse-frontier':
+        return f"(sb-sparse-frontier {render(node[1], ren)} {render(node[2], ren)} {render(node[3], ren)})"
+    if head == 'sparse-scatter':
+        return f"(sb-sparse-scatter {render(node[1], ren)} {render(node[2], ren)} {render(node[3], ren)})"
+    if head == 'sparse-square-sum':
+        return f"(sb-sparse-square-sum {render(node[1], ren)} {render(node[2], ren)})"
+    if head == 'sparse-parallel-rows':
+        return f"(sb-sparse-parallel-rows {render(node[1], ren)} {render(node[2], ren)} {render(node[3], ren)} {render(node[4], ren)} {render(node[5], ren)})"
+    if head == 'sparse-row-tree':
+        return f"(sb-sparse-row-tree {render(node[1], ren)} {render(node[2], ren)})"
+    if head == 'sparse-parallel-tree':
+        return f"(sb-sparse-parallel-tree {render(node[1], ren)} {render(node[2], ren)})"
+    if head == 'sparse-chunk-tree':
+        return f"(sb-sparse-chunk-tree {render(node[1], ren)} {render(node[2], ren)} {render(node[3], ren)})"
+    if head == 'sparse-parallel-chunks':
+        return f"(sb-sparse-parallel-chunks {render(node[1], ren)} {render(node[2], ren)} {render(node[3], ren)})"
     if head == 'let':
         bindings = ' '.join(f"({render(b[0], ren)} {render(b[1], ren)})" for b in node[1])
         return f"(let ({bindings}) {render(node[2], ren)})"
@@ -113,6 +139,95 @@ def main():
     out = [f";; GENERATED from {src_path} by gen_baseline.py -- do not edit.",
            ";; The Scheme file is the single source of truth for this benchmark.",
            "(declaim (optimize (speed 3) (safety 0) (debug 0)))", ""]
+    out += [
+        "(defun sb-map-set (map key value)",
+        "  (setf (gethash key map) value)",
+        "  map)",
+        "",
+        "(defun sb-sparse-scatter (adjacency frontier state)",
+        "  (dolist (event frontier state)",
+        "    (let ((node (first event)) (value (second event)))",
+        "      (unless (zerop value)",
+        "        (dolist (edge (gethash node adjacency))",
+        "          (let ((contribution (* value (second edge))))",
+        "            (unless (zerop contribution)",
+        "              (incf (gethash (first edge) state 0) contribution))))))))",
+        "",
+        "(defun sb-sparse-frontier (adjacency frontier state)",
+        "  (loop while frontier do",
+        "    (let* ((event (pop frontier))",
+        "           (node (first event))",
+        "           (value (second event)))",
+        "      (unless (zerop value)",
+        "        (dolist (edge (gethash node adjacency))",
+        "          (let ((contribution (* value (second edge))))",
+        "            (unless (zerop contribution)",
+        "              (incf (gethash (first edge) state 0) contribution)",
+        "              (push (list (first edge) contribution) frontier)))))))",
+        "  state)",
+        "",
+        "(defun sb-sparse-square-sum (state n)",
+        "  (let ((acc 0))",
+        "    (dotimes (column n acc)",
+        "      (let* ((value (gethash column state 0))",
+        "             (square (mod (* value value) 100000)))",
+        "        (setf acc (mod (+ acc square) 3000000))))))",
+        "",
+        "(defun sb-sparse-parallel-rows (rows adjacency size first last)",
+        "  (if (> first last)",
+        "      0",
+        "      (if (= first last)",
+        "          (let ((acc 0))",
+        "            (let ((state (make-hash-table :test #'eql)))",
+        "              (dolist (event (gethash first rows))",
+        "                (let ((node (first event)) (value (second event)))",
+        "                  (unless (zerop value)",
+        "                    (dolist (edge (gethash node adjacency))",
+        "                      (incf (gethash (first edge) state 0)",
+        "                            (* value (second edge)))))))",
+        "              (dotimes (column size acc)",
+        "                (let ((value (gethash column state 0)))",
+        "                  (setf acc (mod (+ acc (mod (* value value) 100000)) 3000000))))))",
+        "          (let* ((middle (truncate (+ first last) 2))",
+        "                 (left (sb-sparse-parallel-rows rows adjacency size first middle))",
+        "                 (right (sb-sparse-parallel-rows rows adjacency size (+ middle 1) last)))",
+        "            (mod (+ left right) 3000000)))))",
+        "",
+        "(defun sb-sparse-row-tree (rows count)",
+        "  (declare (ignore count))",
+        "  rows)",
+        "",
+        "(defun sb-sparse-parallel-tree (tree size)",
+        "  (let ((acc 0))",
+        "    (dolist (prepared-row tree acc)",
+        "      (let ((state (make-hash-table :test #'eql)))",
+        "        (dolist (item prepared-row)",
+        "          (let ((value (first item)))",
+        "            (unless (zerop value)",
+        "              (dolist (edge (second item))",
+        "                (incf (gethash (first edge) state 0)",
+        "                      (* value (second edge)))))))",
+        "        (dotimes (column size)",
+        "          (let ((value (gethash column state 0)))",
+        "            (setf acc (mod (+ acc (mod (* value value) 100000)) 3000000))))))))",
+        "",
+        "(defun sb-sparse-chunk-tree (rows count chunk-size)",
+        "  (declare (ignore count chunk-size))",
+        "  rows)",
+        "",
+        "(defun sb-sparse-parallel-chunks (tree adjacency size)",
+        "  (let ((acc 0))",
+        "    (dolist (row tree acc)",
+        "      (let ((state (make-hash-table :test #'eql)))",
+        "        (dolist (event row)",
+        "          (dolist (edge (gethash (first event) adjacency))",
+        "            (incf (gethash (first edge) state 0)",
+        "                  (* (second event) (second edge)))))",
+        "        (dotimes (column size)",
+        "          (let ((value (gethash column state 0)))",
+        "            (setf acc (mod (+ acc (mod (* value value) 100000)) 3000000))))))))",
+        "",
+    ]
     for f in globals_:
         out.append(f"(defparameter {global_ren[f[1]]} {render(f[2], global_ren)})")
         out.append("")

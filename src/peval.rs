@@ -93,7 +93,7 @@ impl Pe<'_> {
                 let args = args.iter().map(|a| self.expr(a, env)).collect::<Vec<_>>();
                 if let [Expr::Number(left), Expr::Number(right)] = &args[..] {
                     return match op {
-                        Primitive::Add | Primitive::Sub | Primitive::Mul | Primitive::Div => {
+                        Primitive::Add | Primitive::Sub | Primitive::Mul | Primitive::Mul0 | Primitive::Div => {
                             match self.arithmetic(*op, *left, *right) {
                                 Some(value) => Expr::Number(value),
                                 None => Expr::Primitive { op: *op, args },

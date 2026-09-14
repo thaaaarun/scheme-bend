@@ -10,6 +10,8 @@ fn compiles_the_correctness_corpus() {
         "lists",
         "map",
         "mergesort",
+        "sparse-frontier",
+        "static-graph",
         "tree-sum",
     ] {
         let source = fs::read_to_string(Path::new("examples").join(format!("{name}.scm"))).unwrap();
@@ -17,6 +19,70 @@ fn compiles_the_correctness_corpus() {
         assert!(output.contains("def main():"), "{name}");
         assert!(!output.contains("statement-only expression"), "{name}");
     }
+}
+
+#[test]
+fn emits_only_live_static_graph_nodes_in_topological_order() {
+    let source = fs::read_to_string("examples/static-graph.scm").unwrap();
+    let output = compile(&source).expect("static graph should compile");
+    let graph = output.split("def s_layer").nth(1).unwrap();
+    assert!(graph.contains("s_layerN3 ="));
+    assert!(graph.contains("s_layerN4 ="));
+    assert!(graph.contains("s_layerN5 ="));
+    assert!(graph.contains("s_layerN6 ="));
+    assert!(graph.contains("s_layerN7 ="));
+    assert!(!graph.contains("N8"));
+    assert!(!graph.contains("N9"));
+    assert!(graph.find("N3").unwrap() < graph.find("N5").unwrap());
+    assert!(graph.find("N5").unwrap() < graph.find("N6").unwrap());
+    assert!(output.contains("return s_sum(s_layer(+2, +3, +5), +0)"));
+}
+
+#[test]
+fn emits_the_dynamic_sparse_frontier_kernel() {
+    let source = fs::read_to_string("examples/sparse-frontier.scm").unwrap();
+    let output = compile(&source).expect("sparse frontier should compile");
+    assert!(output.contains("Map/set("));
+    assert!(output.contains("scheme_map_get0("));
+    assert!(output.contains("scheme_map_accumulate("));
+    assert!(output.contains("scheme_sparse_frontier("));
+    assert!(output.contains("Map/get_check("));
+}
+
+#[test]
+fn emits_the_specialized_sparse_scatter_kernel() {
+    let source = fs::read_to_string("benchmarks/matmul-frontier.scm").unwrap();
+    let output = compile(&source).expect("sparse scatter should compile");
+    assert!(output.contains("scheme_sparse_scatter("));
+    assert!(output.contains("scheme_sparse_scatter_edges("));
+    assert!(output.contains("scheme_sparse_square_sum("));
+    assert!(output.contains("scheme_sparse_chunk_tree("));
+    assert!(output.contains("scheme_sparse_parallel_chunks("));
+    assert!(output.contains("Map/get_check("));
+}
+
+#[test]
+fn rejects_cycles_that_reach_a_static_graph_output() {
+    let source = "(define-graph cyclic\n  (nodes 3)\n  (inputs (0))\n  (outputs (2))\n  (edges (0 1 1) (1 2 1) (2 1 1)))\n(cyclic 4)";
+    let error = compile(source).unwrap_err().to_string();
+    assert!(error.contains("cycle on a live path"), "{error}");
+}
+
+#[test]
+fn compiles_the_sparse_matmul_kernel() {
+    let source = fs::read_to_string("benchmarks/matmul-sparse.scm").unwrap();
+    let output = compile(&source).expect("sparse matmul should compile");
+    assert!(output.contains("def s_scatter("));
+    assert!(output.contains("def s_rowsQ45_checksum("));
+}
+
+#[test]
+fn compiles_the_mul0_pruning_workload() {
+    let source = fs::read_to_string("benchmarks/mul0-prune.scm").unwrap();
+    let output = compile(&source).expect("mul0 pruning workload should compile");
+    let main = output.split("def main():").nth(1).unwrap();
+    assert!(main.contains("if (scheme_tmp_"));
+    assert_eq!(main.matches("s_work(+100000, +0)").count(), 1);
 }
 
 #[test]
@@ -64,6 +130,18 @@ fn inlines_helpers_and_shares_repeated_numeric_work() {
             .unwrap();
     assert_eq!(output.matches("s_square(").count(), 1);
     assert!(output.contains("s_schemeOpt"));
+}
+
+#[test]
+fn emits_zero_annihilating_multiply_as_a_guarded_operation() {
+    let output = compile(
+        "(define (opaque n) (if (= n 0) 0 (opaque (- n 1))))\n\
+         (mul0 (opaque 1) (opaque 2))",
+    )
+    .unwrap();
+    assert!(output.contains("if (scheme_tmp_"), "{output}");
+    assert!(output.contains("s_opaque(+1)"), "{output}");
+    assert!(output.contains("s_opaque(+2)"), "{output}");
 }
 
 #[test]

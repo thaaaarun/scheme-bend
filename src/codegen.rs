@@ -29,6 +29,233 @@ def scheme_null(xs):
     case SchemeList/Cons:
       return 0
 
+def scheme_map_get0(map, key, default):
+  (found, rest) = Map/get_check(map, key)
+  match found:
+    case Maybe/Some:
+      return found.value
+    case Maybe/None:
+      return default
+
+def scheme_map_accumulate(map, key, delta):
+  (found, rest) = Map/get_check(map, key)
+  match found:
+    case Maybe/Some:
+      return Map/set(rest, key, found.value + delta)
+    case Maybe/None:
+      return Map/set(rest, key, delta)
+
+type SchemeFrontierState:
+  State { frontier, state }
+
+def scheme_frontier_edges(edges, value, frontier, state):
+  match edges:
+    case SchemeList/Nil:
+      return SchemeFrontierState/State { frontier: frontier, state: state }
+    case SchemeList/Cons:
+      edge = edges.head
+      match edge:
+        case SchemeList/Nil:
+          return scheme_frontier_edges(edges.tail, value, frontier, state)
+        case SchemeList/Cons:
+          edge_tail = edge.tail
+          match edge_tail:
+            case SchemeList/Nil:
+              return scheme_frontier_edges(edges.tail, value, frontier, state)
+            case SchemeList/Cons:
+              destination = edge.head
+              weight = edge_tail.head
+              contribution = value * weight
+              next_state = scheme_map_accumulate(state, destination, contribution)
+              if contribution == +0:
+                next_frontier = frontier
+              else:
+                event = SchemeList/Cons { head: destination, tail: SchemeList/Cons { head: contribution, tail: SchemeList/Nil } }
+                next_frontier = SchemeList/Cons { head: event, tail: frontier }
+              return scheme_frontier_edges(edges.tail, value, next_frontier, next_state)
+
+def scheme_sparse_frontier(adjacency, frontier, state):
+  match frontier:
+    case SchemeList/Nil:
+      return state
+    case SchemeList/Cons:
+      event = frontier.head
+      rest = frontier.tail
+      match event:
+        case SchemeList/Nil:
+          return scheme_sparse_frontier(adjacency, rest, state)
+        case SchemeList/Cons:
+          event_tail = event.tail
+          match event_tail:
+            case SchemeList/Nil:
+              return scheme_sparse_frontier(adjacency, rest, state)
+            case SchemeList/Cons:
+              node = event.head
+              value = event_tail.head
+              if value == +0:
+                return scheme_sparse_frontier(adjacency, rest, state)
+              else:
+                (found, next_adjacency) = Map/get_check(adjacency, node)
+                match found:
+                  case Maybe/None:
+                    return scheme_sparse_frontier(next_adjacency, rest, state)
+                  case Maybe/Some:
+                    result = scheme_frontier_edges(found.value, value, rest, state)
+                    match result:
+                      case SchemeFrontierState/State:
+                        return scheme_sparse_frontier(next_adjacency, result.frontier, result.state)
+
+# One-hop version used by sparse matrix multiplication. Unlike the general
+# frontier kernel, this does not enqueue terminal output events: it expands an
+# input row directly into the accumulator Map. That removes a whole frontier
+# layer and, more importantly, avoids probing the adjacency Map for columns
+# that are known to be outputs rather than source nodes.
+def scheme_sparse_scatter_edges(edges, value, state):
+  match edges:
+    case SchemeList/Nil:
+      return state
+    case SchemeList/Cons:
+      edge = edges.head
+      match edge:
+        case SchemeList/Nil:
+          return scheme_sparse_scatter_edges(edges.tail, value, state)
+        case SchemeList/Cons:
+          edge_tail = edge.tail
+          match edge_tail:
+            case SchemeList/Nil:
+              return scheme_sparse_scatter_edges(edges.tail, value, state)
+            case SchemeList/Cons:
+              destination = edge.head
+              weight = edge_tail.head
+              contribution = value * weight
+              next_state = scheme_map_accumulate(state, destination, contribution)
+              return scheme_sparse_scatter_edges(edges.tail, value, next_state)
+
+def scheme_sparse_scatter(adjacency, frontier, state):
+  match frontier:
+    case SchemeList/Nil:
+      return state
+    case SchemeList/Cons:
+      event = frontier.head
+      rest = frontier.tail
+      match event:
+        case SchemeList/Nil:
+          return scheme_sparse_scatter(adjacency, rest, state)
+        case SchemeList/Cons:
+          event_tail = event.tail
+          match event_tail:
+            case SchemeList/Nil:
+              return scheme_sparse_scatter(adjacency, rest, state)
+            case SchemeList/Cons:
+              node = event.head
+              value = event_tail.head
+              if value == +0:
+                return scheme_sparse_scatter(adjacency, rest, state)
+              else:
+                (found, next_adjacency) = Map/get_check(adjacency, node)
+                match found:
+                  case Maybe/None:
+                    return scheme_sparse_scatter(next_adjacency, rest, state)
+                  case Maybe/Some:
+                    next_state = scheme_sparse_scatter_edges(found.value, value, state)
+                    return scheme_sparse_scatter(next_adjacency, rest, next_state)
+
+# This is the reduction paired with scheme_sparse_scatter in the benchmark
+# adapter. It threads Map/get_check's residual map through the scan, so each
+# output lookup consumes the state once instead of re-traversing a persistent
+# Map from the original root for every column.
+def scheme_sparse_square_sum(state, column, limit, acc):
+  if column == limit:
+    return acc
+  else:
+    (found, rest) = Map/get_check(state, column)
+    match found:
+      case Maybe/None:
+        return scheme_sparse_square_sum(rest, column + 1, limit, acc)
+      case Maybe/Some:
+        value = found.value
+        square = (value * value) - ((value * value) / 100000) * 100000
+        next_acc = (acc + square) - ((acc + square) / 3000000) * 3000000
+        return scheme_sparse_square_sum(rest, column + 1, limit, next_acc)
+
+type SchemeChunkTree:
+  Leaf { rows }
+  Branch { left, right }
+
+type SchemeChunkBuild:
+  Built { tree, rest }
+
+def scheme_chunk_take(rows, count):
+  if count == +0:
+    return SchemeList/Nil
+  else:
+    match rows:
+      case SchemeList/Nil:
+        return SchemeList/Nil
+      case SchemeList/Cons:
+        return SchemeList/Cons { head: rows.head, tail: scheme_chunk_take(rows.tail, count - +1) }
+
+def scheme_chunk_drop(rows, count):
+  if count == +0:
+    return rows
+  else:
+    match rows:
+      case SchemeList/Nil:
+        return SchemeList/Nil
+      case SchemeList/Cons:
+        return scheme_chunk_drop(rows.tail, count - +1)
+
+# Build a balanced tree of contiguous row chunks in one pass over the input
+# spine. A parallel leaf owns a chunk and receives the shared adjacency Map
+# only once, instead of duplicating that Map for every row.
+def scheme_chunk_tree_build(rows, count, chunk_size):
+  if count == +0:
+    return SchemeChunkBuild/Built { tree: SchemeChunkTree/Leaf { rows: SchemeList/Nil }, rest: rows }
+  else:
+    if count <= chunk_size:
+      chunk = scheme_chunk_take(rows, count)
+      rest = scheme_chunk_drop(rows, count)
+      return SchemeChunkBuild/Built { tree: SchemeChunkTree/Leaf { rows: chunk }, rest: rest }
+    else:
+      half = count / +2
+      left_result = scheme_chunk_tree_build(rows, half, chunk_size)
+      match left_result:
+        case SchemeChunkBuild/Built:
+          right_result = scheme_chunk_tree_build(left_result.rest, count - half, chunk_size)
+          match right_result:
+            case SchemeChunkBuild/Built:
+              tree = SchemeChunkTree/Branch { left: left_result.tree, right: right_result.tree }
+              return SchemeChunkBuild/Built { tree: tree, rest: right_result.rest }
+
+def scheme_sparse_chunk_tree(rows, count, chunk_size):
+  result = scheme_chunk_tree_build(rows, count, chunk_size)
+  match result:
+    case SchemeChunkBuild/Built:
+      return result.tree
+
+def scheme_sparse_chunk_rows(rows, adjacency, size):
+  match rows:
+    case SchemeList/Nil:
+      return +0
+    case SchemeList/Cons:
+      state = scheme_sparse_scatter(adjacency, rows.head, Map/Leaf)
+      row_value = scheme_sparse_square_sum(state, +0, size, +0)
+      rest_value = scheme_sparse_chunk_rows(rows.tail, adjacency, size)
+      total = row_value + rest_value
+      return total - (total / +3000000) * 3000000
+
+# The two branches are independent at chunk granularity. Their local row
+# scans share no accumulator; only their scalar totals are merged.
+def scheme_sparse_parallel_chunks(tree, adjacency, size):
+  match tree:
+    case SchemeChunkTree/Leaf:
+      return scheme_sparse_chunk_rows(tree.rows, adjacency, size)
+    case SchemeChunkTree/Branch:
+      left = scheme_sparse_parallel_chunks(tree.left, adjacency, size)
+      right = scheme_sparse_parallel_chunks(tree.right, adjacency, size)
+      total = left + right
+      return total - (total / +3000000) * 3000000
+
 "#;
 
 pub fn emit(program: &ir::Program) -> String {
@@ -40,6 +267,9 @@ pub fn emit(program: &ir::Program) -> String {
         .collect::<BTreeSet<_>>();
     let mut out = PRELUDE.to_owned();
     let mut emitter = Emitter::default();
+    for graph in &program.graphs {
+        emit_graph(graph, &mut out);
+    }
     for definition in &program.definitions {
         let params = definition
             .params
@@ -57,6 +287,95 @@ pub fn emit(program: &ir::Program) -> String {
         None => out.push_str("  return +0\n"),
     }
     out
+}
+
+/// Emit a static graph as a straight-line, dependency-ordered Bend function.
+///
+/// The graph pass has already removed dead nodes, so this function contains no
+/// dense traversal, runtime adjacency structure, or lookup. Independent graph
+/// nodes are visible as separate bindings to HVM's evaluator, while each node
+/// only folds together its explicit incoming edges.
+fn emit_graph(graph: &ir::GraphDefinition, out: &mut String) {
+    let graph_name = mangle(&graph.name);
+    let params = graph
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(index, _)| graph_input_name(&graph_name, index))
+        .collect::<Vec<_>>();
+    out.push_str(&format!("def {graph_name}({}):\n", params.join(", ")));
+
+    for &node in &graph.schedule {
+        let terms = graph
+            .edges
+            .iter()
+            .filter(|edge| edge.dst == node)
+            .map(|edge| graph_term(edge, graph, &graph_name))
+            .collect::<Vec<_>>();
+        out.push_str(&format!(
+            "  {} = {}\n",
+            graph_node_name(&graph_name, node),
+            balanced_sum(&terms)
+        ));
+    }
+
+    let values = graph
+        .outputs
+        .iter()
+        .map(|&node| graph_node_value(graph, &graph_name, node))
+        .collect::<Vec<_>>();
+    out.push_str(&format!("  return {}\n\n", graph_list(&values)));
+}
+
+fn graph_input_name(graph_name: &str, index: usize) -> String {
+    format!("{graph_name}I{index}")
+}
+
+fn graph_node_name(graph_name: &str, node: usize) -> String {
+    format!("{graph_name}N{node}")
+}
+
+fn graph_node_value(graph: &ir::GraphDefinition, graph_name: &str, node: usize) -> String {
+    if let Some(index) = graph.inputs.iter().position(|&input| input == node) {
+        graph_input_name(graph_name, index)
+    } else if graph.live_nodes.contains(&node) {
+        graph_node_name(graph_name, node)
+    } else {
+        "+0".into()
+    }
+}
+
+fn graph_term(edge: &ir::GraphEdge, graph: &ir::GraphDefinition, graph_name: &str) -> String {
+    let source = graph_node_value(graph, graph_name, edge.src);
+    match edge.weight {
+        1 => source,
+        -1 => format!("(+0 - {source})"),
+        weight => format!("({source} * {})", signed_literal(weight)),
+    }
+}
+
+fn balanced_sum(terms: &[String]) -> String {
+    match terms {
+        [] => "+0".into(),
+        [term] => term.clone(),
+        _ => {
+            let middle = terms.len() / 2;
+            format!(
+                "({} + {})",
+                balanced_sum(&terms[..middle]),
+                balanced_sum(&terms[middle..])
+            )
+        }
+    }
+}
+
+fn graph_list(values: &[String]) -> String {
+    values
+        .iter()
+        .rev()
+        .fold("SchemeList/Nil".into(), |tail, value| {
+            format!("SchemeList/Cons {{ head: {value}, tail: {tail} }}")
+        })
 }
 
 #[derive(Default)]
@@ -257,14 +576,43 @@ impl Emitter {
             Expr::Var(name) if globals.contains(name) => format!("{}()", mangle(name)),
             Expr::Var(name) => mangle(name),
             Expr::Call { callee, args } => {
+                if callee == "__scheme_map_empty" {
+                    return "Map/Leaf".into();
+                }
                 let args = args
                     .iter()
                     .map(|arg| self.emit_value(arg, depth, globals, out))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                format!("{}({args})", mangle(callee))
+                    .collect::<Vec<_>>();
+                if callee == "__scheme_map_get" {
+                    return format!("scheme_map_get0({})", args.join(", "));
+                }
+                if callee == "__scheme_map_set" {
+                    return format!("Map/set({})", args.join(", "));
+                }
+                if callee == "__scheme_sparse_frontier" {
+                    return format!("scheme_sparse_frontier({})", args.join(", "));
+                }
+                if callee == "__scheme_sparse_scatter" {
+                    return format!("scheme_sparse_scatter({})", args.join(", "));
+                }
+                if callee == "__scheme_sparse_square_sum" {
+                    return format!(
+                        "scheme_sparse_square_sum({}, +0, {}, +0)",
+                        args[0], args[1]
+                    );
+                }
+                if callee == "__scheme_sparse_chunk_tree" {
+                    return format!("scheme_sparse_chunk_tree({})", args.join(", "));
+                }
+                if callee == "__scheme_sparse_parallel_chunks" {
+                    return format!("scheme_sparse_parallel_chunks({})", args.join(", "));
+                }
+                format!("{}({})", mangle(callee), args.join(", "))
             }
             Expr::Primitive { op, args } => {
+                if *op == Primitive::Mul0 {
+                    return self.emit_mul0(args, depth, globals, out);
+                }
                 let args = args
                     .iter()
                     .map(|arg| self.emit_value(arg, depth, globals, out))
@@ -319,6 +667,49 @@ impl Emitter {
                 result
             }
         }
+    }
+
+    /// Emit zero-annihilating multiplication as control flow at the call site.
+    /// Bend function arguments are eager, so a helper such as `scheme_mul0(a,
+    /// b)` cannot prevent `b` from being demanded. Keeping the RHS emission
+    /// inside the nonzero branch does.
+    fn emit_mul0(
+        &mut self,
+        args: &[Expr],
+        depth: usize,
+        globals: &BTreeSet<String>,
+        out: &mut String,
+    ) -> String {
+        let [left_expr, right_expr] = args else {
+            unreachable!("mul0 is lowered with exactly two arguments")
+        };
+        let left_value = self.emit_value(left_expr, depth, globals, out);
+        let left = self.temp();
+        let result = self.temp();
+        let pad = "  ".repeat(depth);
+        out.push_str(&format!("{pad}{left} = {left_value}\n"));
+        out.push_str(&format!("{pad}if ({left} == +0):\n"));
+        out.push_str(&format!("{}{} = +0\n", "  ".repeat(depth + 1), result));
+        out.push_str(&format!("{pad}else:\n"));
+
+        // This emission occurs inside the else branch. Calls and lets in the
+        // RHS are therefore not demanded when the left operand is zero.
+        let right_value = self.emit_value(right_expr, depth + 1, globals, out);
+        let right = self.temp();
+        out.push_str(&format!(
+            "{}{} = {right_value}\n",
+            "  ".repeat(depth + 1),
+            right
+        ));
+        out.push_str(&format!("{}if ({right} == +0):\n", "  ".repeat(depth + 1)));
+        out.push_str(&format!("{}{} = +0\n", "  ".repeat(depth + 2), result));
+        out.push_str(&format!("{}else:\n", "  ".repeat(depth + 1)));
+        out.push_str(&format!(
+            "{}{} = ({left} * {right})\n",
+            "  ".repeat(depth + 2),
+            result
+        ));
+        result
     }
 }
 /// Recognises `(null? x)` where `x` is a plain variable.
@@ -677,6 +1068,7 @@ fn render_primitive(op: Primitive, args: &[String]) -> String {
         Primitive::Add => "+",
         Primitive::Sub => "-",
         Primitive::Mul => "*",
+        Primitive::Mul0 => unreachable!("mul0 is emitted above"),
         Primitive::Div => "/",
         Primitive::Eq => "==",
         Primitive::Lt => "<",
