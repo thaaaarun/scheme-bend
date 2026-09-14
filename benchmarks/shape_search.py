@@ -21,9 +21,12 @@ import os, re, shutil, statistics, subprocess, sys, tempfile, time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 BEND = os.path.expanduser("~/.cargo/bin/bend")
-THREADS = [1, 2, 4, 8]
+THREADS = [int(t) for t in os.environ.get("THREADS", "1,2,4,8").split(",")]
 SHAPES = os.environ.get("SHAPES", "asis,balanced,chunked:2,chunked:4,chunked:8").split(",")
 ROUNDS = int(os.environ.get("ROUNDS", "5"))
+# Either `benchmarks/shapes/<program>/<program>.scm` or a flat directory of
+# `<program>.scm`, so the same harness can sweep the benchmark suite.
+PROGRAMS = os.environ.get("PROGRAMS", os.path.join("benchmarks", "shapes"))
 
 
 def sh(cmd):
@@ -55,18 +58,25 @@ def run(exe):
 
 
 def main():
-    shapes_root = os.path.join(ROOT, "benchmarks", "shapes")
-    programs = sorted(d for d in os.listdir(shapes_root)
-                      if os.path.isdir(os.path.join(shapes_root, d)))
-    if not programs:
-        sys.exit("no programs under benchmarks/shapes/")
+    shapes_root = os.path.join(ROOT, PROGRAMS)
+    nested = {
+        d: os.path.join(shapes_root, d, f"{d}.scm")
+        for d in sorted(os.listdir(shapes_root))
+        if os.path.isdir(os.path.join(shapes_root, d))
+    }
+    nested = {d: p for d, p in nested.items() if os.path.exists(p)}
+    flat = {
+        f[:-4]: os.path.join(shapes_root, f)
+        for f in sorted(os.listdir(shapes_root))
+        if f.endswith(".scm")
+    }
+    sources = nested or flat
+    if not sources:
+        sys.exit(f"no programs under {PROGRAMS}/")
 
     tmp = tempfile.mkdtemp()
     try:
-        for prog in programs:
-            scm = os.path.join(shapes_root, prog, f"{prog}.scm")
-            if not os.path.exists(scm):
-                continue
+        for prog, scm in sources.items():
 
             # --- correctness gate + compile + warm up ---
             exes, seen, itrs = {}, {}, {}

@@ -13,6 +13,9 @@
 set -eu
 
 runs=${RUNS:-5}
+# Which code shape to compile with; see `scheme-bend --shape` and
+# docs in src/shape.rs. Defaults to as-written.
+shape=${SHAPE:-asis}
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 bend_bin=${BEND:-"$HOME/.cargo/bin/bend"}
 tmp=$(mktemp -d)
@@ -32,6 +35,7 @@ timeit() {
 # Floor: process startup dominates anything near it, so mark those rows.
 floor=$(timeit sbcl --noinform --non-interactive --eval '(quit)')
 
+echo "# shape: $shape   runs: $runs"
 printf '%-16s %-12s %-8s %-9s %-9s %-6s %s\n' benchmark result match itrs bend_s sbcl_s note
 printf '%-16s %-12s %-8s %-9s %-9s %-6s %s\n' ---------------- ------------ -------- --------- --------- ------ ----
 
@@ -39,7 +43,7 @@ for scm in "$root"/benchmarks/*.scm; do
   name=$(basename "$scm" .scm)
   python3 "$root/benchmarks/gen_baseline.py" "$scm" > "$tmp/$name.lisp"
 
-  cargo run --quiet --manifest-path "$root/Cargo.toml" -- "$scm" > "$tmp/$name.bend"
+  cargo run --quiet --manifest-path "$root/Cargo.toml" -- --shape="$shape" "$scm" > "$tmp/$name.bend"
   "$bend_bin" gen-c "$tmp/$name.bend" > "$tmp/$name.c" 2>/dev/null
   clang -O3 -pthread "$tmp/$name.c" -o "$tmp/$name-bin"
 
