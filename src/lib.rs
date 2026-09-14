@@ -4,6 +4,7 @@ pub mod ast;
 pub mod codegen;
 pub mod ir;
 pub mod optimize;
+pub mod peval;
 pub mod sexpr;
 pub mod shape;
 

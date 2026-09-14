@@ -16,6 +16,7 @@ fn main() -> ExitCode {
                     constant_propagation: false,
                     // Shape is an independent axis; --no-opt leaves it alone.
                     shape: options.shape,
+                    peval: options.peval,
                 };
             }
             "--tail-unroll" => {
@@ -39,10 +40,28 @@ fn main() -> ExitCode {
                     Err(()) => return usage(),
                 }
             }
+            _ if argument.starts_with("--peval=") => {
+                match argument["--peval=".len()..].parse::<u64>() {
+                    Ok(fuel) => options.peval = fuel,
+                    Err(_) => return usage(),
+                }
+            }
             _ if argument.starts_with("--shape=") => {
                 match parse_shape(&argument["--shape=".len()..]) {
                     Ok(shape) => options.shape = shape,
                     Err(()) => return usage(),
+                }
+            }
+            "--peval" => {
+                let Some(value) = args.next() else {
+                    return usage();
+                };
+                match value.parse::<u64>() {
+                    Ok(fuel) => options.peval = fuel,
+                    Err(_) => {
+                        eprintln!("scheme-bend: --peval expects a non-negative integer");
+                        return ExitCode::from(2);
+                    }
                 }
             }
             "--no-cse" => options.common_subexpressions = false,
@@ -89,7 +108,7 @@ fn parse_shape(value: &str) -> Result<Shape, ()> {
 fn usage() -> ExitCode {
     eprintln!(
         "usage: scheme-bend [--no-opt] [--no-cse] [--no-const-prop] [--tail-unroll 1..8] \
-         [--shape asis|balanced|chunked:N] <input.scm>"
+         [--shape asis|balanced|chunked:N] [--peval N] <input.scm>"
     );
     ExitCode::from(2)
 }

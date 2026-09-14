@@ -34,6 +34,9 @@ pub struct Options {
     /// the lever over parallelism, since HVM finds parallelism in the net
     /// rather than from annotations; `benchmarks/shape_search.py` picks it.
     pub shape: Shape,
+    /// Fuel for partial evaluation: the number of inlined calls it may make.
+    /// `0` disables it. See `crate::peval`.
+    pub peval: u64,
 }
 
 impl Default for Options {
@@ -44,6 +47,7 @@ impl Default for Options {
             tail_unroll: 8,
             constant_propagation: true,
             shape: Shape::AsWritten,
+            peval: 0,
         }
     }
 }
@@ -92,6 +96,19 @@ pub fn optimize(program: Program, options: Options) -> Program {
         });
     }
 
+    // Last: partial evaluation knows real values, so it runs after the passes
+    // that only rearrange syntax, and the fold rules then clean up after it.
+    let mut program = crate::peval::apply(program, options.peval);
+    if options.peval > 0 {
+        // Substituting arguments leaves literal `let` bindings behind, and the
+        // unfolded code creates many. Sweep them before emitting.
+        for definition in &mut program.definitions {
+            definition.body = settle(definition.body.clone(), options.constant_propagation);
+        }
+        if let Some(body) = program.body.take() {
+            program.body = Some(settle(body, options.constant_propagation));
+        }
+    }
     program
 }
 
@@ -592,11 +609,73 @@ fn drop_unused_bindings(expr: Expr) -> Expr {
     }
 }
 
+/// Algebraic identities that hold for every 24-bit operand, so they can fire
+/// without knowing the value.
+///
+/// The identities that only *rearrange* -- `x*1`, `x+0`, `x-0`, `x/1` -- are
+/// unconditionally safe, because wrapping multiplication and addition make 1
+/// an identity and 0 neutral for every operand, and dropping a literal cannot
+/// change evaluation.
+///
+/// The absorbing ones (`0*x`) *discard* the other operand, which in a strict
+/// language removes its evaluation. That is only done when the operand is
+/// `droppable`, the same conservative policy `drop_unused_bindings` uses, so a
+/// possibly-diverging call is never quietly deleted.
+///
+/// These fire only on *literal* constants. They cannot see a zero that a
+/// program computed at runtime, which is why they do nothing for a matrix
+/// whose entries are generated arithmetically.
+fn fold_identity(op: Primitive, args: &[Expr]) -> Option<Expr> {
+    let [left, right] = args else { return None };
+    let number = |e: &Expr| match e {
+        Expr::Number(n) => Some(*n),
+        _ => None,
+    };
+    match op {
+        Primitive::Mul => {
+            if number(left) == Some(0) && droppable(right) {
+                return Some(Expr::Number(0));
+            }
+            if number(right) == Some(0) && droppable(left) {
+                return Some(Expr::Number(0));
+            }
+            if number(left) == Some(1) {
+                return Some(right.clone());
+            }
+            if number(right) == Some(1) {
+                return Some(left.clone());
+            }
+        }
+        Primitive::Add => {
+            if number(left) == Some(0) {
+                return Some(right.clone());
+            }
+            if number(right) == Some(0) {
+                return Some(left.clone());
+            }
+        }
+        Primitive::Sub => {
+            if number(right) == Some(0) {
+                return Some(left.clone());
+            }
+        }
+        Primitive::Div => {
+            if number(right) == Some(1) {
+                return Some(left.clone());
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
 fn simplify(expr: Expr) -> Expr {
     match expr {
         Expr::Primitive { op, args } => {
             let args = args.into_iter().map(simplify).collect::<Vec<_>>();
-            fold_primitive(op, &args).unwrap_or(Expr::Primitive { op, args })
+            fold_primitive(op, &args)
+                .or_else(|| fold_identity(op, &args))
+                .unwrap_or(Expr::Primitive { op, args })
         }
         Expr::If {
             condition,
